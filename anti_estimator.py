@@ -3,14 +3,16 @@
 Antigravity Token Estimator — nettop-based passive monitor
 Tracks language_server_macos_arm network traffic and estimates token usage.
 
-Model: Claude Opus 4.6 (Thinking)
-Pricing: $5/M input, $25/M output
+Supports 6 Antigravity models with individual pricing.
+Applies API traffic ratio (nettop captures ~6x more than actual API calls).
 
 Usage:
   python3 anti_estimator.py start   # Start daemon
   python3 anti_estimator.py stop    # Stop daemon
   python3 anti_estimator.py status  # Show current session stats
   python3 anti_estimator.py report  # Daily report
+  python3 anti_estimator.py model   # Show/switch model
+  python3 anti_estimator.py model 3 # Quick switch to model #3
 """
 import json
 import os
@@ -27,31 +29,102 @@ LOG_DIR = Path.home() / ".config" / "anti-tracker"
 USAGE_LOG = LOG_DIR / "nettop_usage.jsonl"
 PID_FILE = LOG_DIR / "estimator.pid"
 SNAPSHOT_FILE = LOG_DIR / "last_snapshot.json"
+MODEL_FILE = LOG_DIR / "current_model.json"
 POLL_INTERVAL = 30  # seconds
 
-# Claude Opus 4.6 Thinking pricing ($/M tokens)
-MODEL = "claude-opus-4-6-thinking"
-INPUT_PRICE_PER_M = 5.00
-OUTPUT_PRICE_PER_M = 25.00
+# === Model Catalog ===
+# Pricing from public API rates ($/M tokens)
+MODELS = {
+    "gemini-3.1-pro-high": {
+        "name": "Gemini 3.1 Pro (High)",
+        "input_price": 1.25,
+        "output_price": 10.00,
+        "shortcut": "1",
+    },
+    "gemini-3.1-pro-low": {
+        "name": "Gemini 3.1 Pro (Low)",
+        "input_price": 0.30,
+        "output_price": 2.50,
+        "shortcut": "2",
+    },
+    "gemini-3-flash": {
+        "name": "Gemini 3 Flash",
+        "input_price": 0.10,
+        "output_price": 0.40,
+        "shortcut": "3",
+    },
+    "claude-sonnet-4.6-thinking": {
+        "name": "Claude Sonnet 4.6 (Thinking)",
+        "input_price": 3.00,
+        "output_price": 15.00,
+        "shortcut": "4",
+    },
+    "claude-opus-4.6-thinking": {
+        "name": "Claude Opus 4.6 (Thinking)",
+        "input_price": 5.00,
+        "output_price": 25.00,
+        "shortcut": "5",
+    },
+    "gpt-oss-120b-medium": {
+        "name": "GPT-OSS 120B (Medium)",
+        "input_price": 1.00,
+        "output_price": 4.00,
+        "shortcut": "6",
+    },
+}
+DEFAULT_MODEL = "gemini-3.1-pro-high"
 
-# Calibration: bytes-to-token ratio (TCP payload level)
-# Calibrated via tcpdump: 328 bursts, 290+ real pairs, B/tok=4.0
-# Auto-loads from calibration_result.json if available
+# === API Traffic Ratio ===
+# nettop captures ALL language_server traffic (telemetry, file sync, extensions, etc.)
+# Only ~17% is actual API calls to daily-cloudcode-pa.googleapis.com
+# Calibrated: tcpdump API-only = 132MB vs nettop total = 758MB → ratio = 0.174
+API_TRAFFIC_RATIO = 0.174
+
+# === Calibration ===
+# bytes-to-token ratio at TCP payload level
+# Calibrated via tcpdump: 328 bursts, 290+ real pairs
 CAL_FILE = LOG_DIR / "calibration_result.json"
-_DEFAULT_OUT = 4.0  # outbound bytes per input token (tcpdump calibrated)
-_DEFAULT_IN = 4.0   # inbound bytes per output token (tcpdump calibrated)
+_DEFAULT_BPT = 4.0  # bytes per token (both directions)
+
 
 def _load_calibration():
     if CAL_FILE.exists():
         try:
             with open(CAL_FILE) as f:
                 cal = json.load(f)
-            return cal.get("bytes_out_per_input_token", _DEFAULT_OUT), cal.get("bytes_in_per_output_token", _DEFAULT_IN)
+            return (
+                cal.get("bytes_out_per_input_token", _DEFAULT_BPT),
+                cal.get("bytes_in_per_output_token", _DEFAULT_BPT),
+            )
         except Exception:
             pass
-    return _DEFAULT_OUT, _DEFAULT_IN
+    return _DEFAULT_BPT, _DEFAULT_BPT
+
+
+def _load_model():
+    if MODEL_FILE.exists():
+        try:
+            with open(MODEL_FILE) as f:
+                data = json.load(f)
+            model_id = data.get("model", DEFAULT_MODEL)
+            if model_id in MODELS:
+                return model_id
+        except Exception:
+            pass
+    return DEFAULT_MODEL
+
+
+def _save_model(model_id):
+    ensure_dir()
+    with open(MODEL_FILE, "w") as f:
+        json.dump({"model": model_id, "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+
 
 BYTES_OUT_PER_INPUT_TOKEN, BYTES_IN_PER_OUTPUT_TOKEN = _load_calibration()
+CURRENT_MODEL_ID = _load_model()
+CURRENT_MODEL = MODELS[CURRENT_MODEL_ID]
+INPUT_PRICE_PER_M = CURRENT_MODEL["input_price"]
+OUTPUT_PRICE_PER_M = CURRENT_MODEL["output_price"]
 
 
 def ensure_dir():
@@ -78,7 +151,6 @@ def get_nettop_snapshot():
                         bytes_out = int(parts[2])
                         total_in += bytes_in
                         total_out += bytes_out
-                        # Extract PID from "language_server.12345"
                         pid = name_pid.split(".")[-1] if "." in name_pid else "?"
                         pids.append(pid)
                     except (ValueError, IndexError):
@@ -89,14 +161,21 @@ def get_nettop_snapshot():
             "pids": pids,
             "time": time.time(),
         }
-    except Exception as e:
+    except Exception:
         return None
 
 
 def estimate_tokens(delta_bytes_in, delta_bytes_out):
-    """Estimate token counts from network byte deltas."""
-    input_tokens = max(0, int(delta_bytes_out / BYTES_OUT_PER_INPUT_TOKEN))
-    output_tokens = max(0, int(delta_bytes_in / BYTES_IN_PER_OUTPUT_TOKEN))
+    """Estimate token counts from network byte deltas.
+    
+    Applies API_TRAFFIC_RATIO to account for non-API traffic in nettop data.
+    """
+    # Only ~17% of nettop traffic is actual API calls
+    api_bytes_out = delta_bytes_out * API_TRAFFIC_RATIO
+    api_bytes_in = delta_bytes_in * API_TRAFFIC_RATIO
+
+    input_tokens = max(0, int(api_bytes_out / BYTES_OUT_PER_INPUT_TOKEN))
+    output_tokens = max(0, int(api_bytes_in / BYTES_IN_PER_OUTPUT_TOKEN))
     input_cost = input_tokens * INPUT_PRICE_PER_M / 1_000_000
     output_cost = output_tokens * OUTPUT_PRICE_PER_M / 1_000_000
     return {
@@ -130,7 +209,8 @@ def daemon_loop():
     """Main monitoring loop."""
     ensure_dir()
     print(f"🔍 Antigravity Token Estimator started")
-    print(f"   Model: {MODEL}")
+    print(f"   Model: {CURRENT_MODEL['name']} (${INPUT_PRICE_PER_M}/M in, ${OUTPUT_PRICE_PER_M}/M out)")
+    print(f"   API traffic ratio: {API_TRAFFIC_RATIO:.1%}")
     print(f"   Polling every {POLL_INTERVAL}s")
     print(f"   Log: {USAGE_LOG}")
     print(f"   PID: {os.getpid()}")
@@ -182,7 +262,7 @@ def daemon_loop():
 
         entry = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "model": MODEL,
+            "model": CURRENT_MODEL_ID,
             "delta_bytes_in": delta_in,
             "delta_bytes_out": delta_out,
             "session_bytes_in": session_in,
@@ -221,6 +301,9 @@ def cmd_start():
         print("❌ No language_server_macos_arm process found.")
         print("   Make sure Antigravity is running.")
         return
+
+    print(f"📋 Current model: {CURRENT_MODEL['name']}")
+    print(f"   Switch with: python3 {sys.argv[0]} model")
 
     # Fork to background
     if "--foreground" in sys.argv or "-f" in sys.argv:
@@ -292,9 +375,11 @@ def cmd_status():
 
     print(f"📊 Antigravity Token Estimator — {today}")
     print(f"   Status: {'🟢 Running' if running else '🔴 Stopped'}")
-    print(f"   Model: {MODEL}")
+    print(f"   Model: {CURRENT_MODEL['name']}")
+    print(f"   API traffic ratio: {API_TRAFFIC_RATIO:.1%}")
     print(f"   ──────────────────────────────────")
-    print(f"   Network: {total_bytes_in:,} bytes in / {total_bytes_out:,} bytes out")
+    print(f"   Network (raw):  {total_bytes_in:,} in / {total_bytes_out:,} out")
+    print(f"   Network (API):  ~{int(total_bytes_in * API_TRAFFIC_RATIO):,} in / ~{int(total_bytes_out * API_TRAFFIC_RATIO):,} out")
     print(f"   ──────────────────────────────────")
     print(f"   Input tokens (est):  {total_in:>12,}")
     print(f"   Output tokens (est): {total_out:>12,}")
@@ -337,7 +422,8 @@ def cmd_report():
             d["bytes_out"] += e.get("delta_bytes_out", 0)
             d["entries"] += 1
 
-    print(f"📊 Antigravity Estimated Token Usage ({MODEL})")
+    print(f"📊 Antigravity Estimated Token Usage")
+    print(f"   Model: {CURRENT_MODEL['name']} | API ratio: {API_TRAFFIC_RATIO:.1%}")
     print(f"{'─' * 75}")
     print(f"{'Date':<12} {'Input Tok':>12} {'Output Tok':>12} {'Traffic':>12} {'Cost (est)':>12}")
     print(f"{'─' * 75}")
@@ -354,8 +440,49 @@ def cmd_report():
 
     print(f"{'─' * 75}")
     print(f"{'TOTAL':<12} {grand_in:>12,} {grand_out:>12,} {'':>12} ${grand_cost:>10.2f}")
-    print(f"\n⚠️  Estimates based on ~{BYTES_OUT_PER_INPUT_TOKEN:.1f} bytes/input token, "
-          f"~{BYTES_IN_PER_OUTPUT_TOKEN:.1f} bytes/output token (tcpdump calibrated). Actual may vary ±15%.")
+    print(f"\n⚠️  Estimates: {API_TRAFFIC_RATIO:.0%} API ratio × {BYTES_OUT_PER_INPUT_TOKEN:.1f} B/tok. Actual may vary ±30%.")
+
+
+def cmd_model():
+    """Show or switch the current model."""
+    ensure_dir()
+
+    # Quick switch: `model 3` or `model gemini-3-flash`
+    if len(sys.argv) >= 3:
+        choice = sys.argv[2]
+        # Try shortcut number
+        for mid, m in MODELS.items():
+            if m["shortcut"] == choice:
+                _save_model(mid)
+                print(f"✅ Switched to {m['name']}")
+                print(f"   ${m['input_price']}/M in, ${m['output_price']}/M out")
+                print(f"\n⚠️  Restart daemon for new pricing: python3 {sys.argv[0]} stop && python3 {sys.argv[0]} start")
+                return
+        # Try model ID
+        if choice in MODELS:
+            _save_model(choice)
+            m = MODELS[choice]
+            print(f"✅ Switched to {m['name']}")
+            print(f"   ${m['input_price']}/M in, ${m['output_price']}/M out")
+            print(f"\n⚠️  Restart daemon for new pricing: python3 {sys.argv[0]} stop && python3 {sys.argv[0]} start")
+            return
+        print(f"❌ Unknown model: {choice}")
+
+    # Show model list
+    print(f"📋 Antigravity Model Selection")
+    print(f"   Current: {CURRENT_MODEL['name']}")
+    print(f"{'─' * 60}")
+    print(f" {'#':<3} {'Model':<35} {'$/M in':>8} {'$/M out':>8}")
+    print(f"{'─' * 60}")
+    for mid, m in MODELS.items():
+        marker = " ◀" if mid == CURRENT_MODEL_ID else ""
+        print(f" [{m['shortcut']}] {m['name']:<35} ${m['input_price']:>6.2f} ${m['output_price']:>6.2f}{marker}")
+    print(f"{'─' * 60}")
+    print(f"\n💡 Quick switch:")
+    print(f"   python3 {sys.argv[0]} model 1   # Gemini 3.1 Pro (High)")
+    print(f"   python3 {sys.argv[0]} model 5   # Claude Opus 4.6")
+    print(f"\n⚠️  After switching, restart daemon:")
+    print(f"   python3 {sys.argv[0]} stop && python3 {sys.argv[0]} start")
 
 
 if __name__ == "__main__":
@@ -365,12 +492,14 @@ if __name__ == "__main__":
         "stop": cmd_stop,
         "status": cmd_status,
         "report": cmd_report,
+        "model": cmd_model,
     }
     if cmd in cmds:
         cmds[cmd]()
     else:
-        print(f"Usage: {sys.argv[0]} [start|stop|status|report]")
-        print(f"  start  — Start monitoring daemon")
-        print(f"  stop   — Stop monitoring daemon")
-        print(f"  status — Show today's stats")
-        print(f"  report — Daily report")
+        print(f"Usage: {sys.argv[0]} [start|stop|status|report|model]")
+        print(f"  start      — Start monitoring daemon")
+        print(f"  stop       — Stop monitoring daemon")
+        print(f"  status     — Show today's stats")
+        print(f"  report     — Daily report")
+        print(f"  model      — Show/switch model (model 1-6)")
