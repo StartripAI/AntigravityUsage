@@ -3,6 +3,11 @@
 star-tokens — Unified AI Token Usage Dashboard (Native GUI)
 Uses pywebview for native macOS window with liquid glass UI.
 
+Features:
+  - Daily / Weekly / Monthly time range tabs (default: Monthly)
+  - Codex CLI (precise) + Antigravity (estimated) unified view
+  - Date range label showing selected period
+
 Usage:
     python3 star_tokens.py
 """
@@ -18,11 +23,34 @@ from pathlib import Path
 
 PORT = 18877  # Internal port for API
 ANTI_LOG = Path.home() / ".config" / "anti-tracker" / "nettop_usage.jsonl"
+MODEL_FILE = Path.home() / ".config" / "anti-tracker" / "current_model.json"
 ESTIMATOR_SCRIPT = Path(__file__).parent / "anti_estimator.py"
 
-ANTI_MODEL = "claude-opus-4-6-thinking"
-ANTI_INPUT_PRICE = 5.00
-ANTI_OUTPUT_PRICE = 25.00
+# Load model info
+MODELS = {
+    "gemini-3.1-pro-high": {"name": "Gemini 3.1 Pro (High)", "input_price": 1.25, "output_price": 10.00},
+    "gemini-3.1-pro-low": {"name": "Gemini 3.1 Pro (Low)", "input_price": 0.30, "output_price": 2.50},
+    "gemini-3-flash": {"name": "Gemini 3 Flash", "input_price": 0.10, "output_price": 0.40},
+    "claude-sonnet-4.6-thinking": {"name": "Claude Sonnet 4.6 (Thinking)", "input_price": 3.00, "output_price": 15.00},
+    "claude-opus-4.6-thinking": {"name": "Claude Opus 4.6 (Thinking)", "input_price": 5.00, "output_price": 25.00},
+    "gpt-oss-120b-medium": {"name": "GPT-OSS 120B (Medium)", "input_price": 1.00, "output_price": 4.00},
+}
+
+def _get_current_model():
+    if MODEL_FILE.exists():
+        try:
+            with open(MODEL_FILE) as f:
+                data = json.load(f)
+            mid = data.get("model", "claude-opus-4.6-thinking")
+            if mid in MODELS:
+                return mid, MODELS[mid]
+        except Exception:
+            pass
+    return "claude-opus-4.6-thinking", MODELS["claude-opus-4.6-thinking"]
+
+ANTI_MODEL_ID, ANTI_MODEL = _get_current_model()
+ANTI_INPUT_PRICE = ANTI_MODEL["input_price"]
+ANTI_OUTPUT_PRICE = ANTI_MODEL["output_price"]
 
 
 def get_codex_data():
@@ -82,7 +110,6 @@ def build_api_response():
         all_dates.add(date)
     all_dates.update(anti.keys())
     combined = []
-    total_codex_cost = total_anti_cost = total_codex_tokens = total_anti_tokens = 0
     for date in sorted(all_dates):
         entry = {"date": date, "codex": None, "antigravity": None}
         if date in codex_by_date:
@@ -94,24 +121,19 @@ def build_api_response():
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
                 "total_tokens": ct, "cost": round(cc, 2), "models": list(cd.get("models", {}).keys()),
             }
-            total_codex_cost += cc; total_codex_tokens += ct
         if date in anti:
             ad = anti[date]
             ac, at = ad["cost"], ad["input_tokens"] + ad["output_tokens"]
             entry["antigravity"] = {
                 "input_tokens": ad["input_tokens"], "output_tokens": ad["output_tokens"],
                 "total_tokens": at, "cost": round(ac, 2), "bytes_in": ad["bytes_in"], "bytes_out": ad["bytes_out"],
-                "model": ANTI_MODEL, "estimated": True,
+                "model": ANTI_MODEL["name"], "estimated": True,
             }
-            total_anti_cost += ac; total_anti_tokens += at
         combined.append(entry)
     return {
         "daily": combined,
-        "totals": {"codex_cost": round(total_codex_cost, 2), "codex_tokens": total_codex_tokens,
-                   "anti_cost": round(total_anti_cost, 2), "anti_tokens": total_anti_tokens,
-                   "total_cost": round(total_codex_cost + total_anti_cost, 2),
-                   "total_tokens": total_codex_tokens + total_anti_tokens},
         "anti_estimator": anti_status,
+        "model": ANTI_MODEL["name"],
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -156,7 +178,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .gl{background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(180%);-webkit-backdrop-filter:blur(var(--blur)) saturate(180%);border:1px solid var(--gb);border-radius:var(--radius);box-shadow:var(--sh);transition:all var(--t)}
 .gl:hover{background:var(--gh)}
 .ct{max-width:1200px;margin:0 auto;padding:24px;position:relative;z-index:1}
-.hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:16px}
+.hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:16px}
 .logo{display:flex;align-items:center;gap:14px}
 .li{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--a2));display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px rgba(108,99,255,0.3)}
 .logo h1{font-size:26px;font-weight:800;letter-spacing:-0.5px}
@@ -175,6 +197,14 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 @keyframes pl{0%,100%{opacity:1}50%{opacity:0.3}}
 .rb{background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--gb);color:var(--t2);padding:7px 16px;border-radius:12px;cursor:pointer;font-size:13px;font-family:inherit;transition:all 0.2s}
 .rb:hover{border-color:var(--accent);color:var(--accent)}
+/* Time range tabs */
+.tabs{display:flex;gap:4px;padding:4px;border-radius:14px;background:var(--surface);border:1px solid var(--gb);margin-bottom:20px;width:fit-content}
+.tab{padding:8px 20px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s;color:var(--t2);border:none;background:none;font-family:inherit;letter-spacing:0.3px}
+.tab:hover{color:var(--text)}
+.tab.active{background:var(--accent);color:#fff;box-shadow:0 2px 12px rgba(108,99,255,0.4)}
+.range-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+.range-label{font-size:14px;color:var(--t2);font-weight:500;font-family:'JetBrains Mono',monospace}
+.range-label span{color:var(--text);font-weight:700}
 .cds{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}
 .cd{padding:22px;position:relative;overflow:hidden}
 .cd .lb{font-size:11px;color:var(--t2);text-transform:uppercase;letter-spacing:1.2px;font-weight:600;margin-bottom:10px}
@@ -227,6 +257,16 @@ tr:hover td{background:rgba(108,99,255,0.03)}
       <div class="tt" onclick="toggleTheme()"><span class="i m">🌙</span><span class="i s">☀️</span></div>
     </div>
   </div>
+  <div class="tabs" id="tabs">
+    <button class="tab" data-range="daily" onclick="setRange('daily')">Daily</button>
+    <button class="tab" data-range="weekly" onclick="setRange('weekly')">Weekly</button>
+    <button class="tab active" data-range="monthly" onclick="setRange('monthly')">Monthly</button>
+    <button class="tab" data-range="all" onclick="setRange('all')">All Time</button>
+  </div>
+  <div class="range-row">
+    <div class="range-label" id="rl"></div>
+    <div class="range-label" id="mdl"></div>
+  </div>
   <div class="cds" id="cds"></div>
   <div class="gl sc">
     <h2>Daily Cost<div class="lg"><div class="lgi"><div class="lgd" style="background:var(--green)"></div>Codex</div><div class="lgi"><div class="lgd" style="background:var(--orange)"></div>Antigravity</div></div></h2>
@@ -240,22 +280,77 @@ tr:hover td{background:rgba(108,99,255,0.03)}
 </div>
 <script>
 const F=n=>n.toLocaleString(),C=n=>'$'+n.toFixed(2);
+let _allData=null, _range='monthly';
+
 function toggleTheme(){const t=document.body.dataset.theme==='dark'?'light':'dark';document.body.dataset.theme=t;localStorage.setItem('st-t',t)}
-(()=>{const t=localStorage.getItem('st-t');if(t)document.body.dataset.theme=t})();
-async function refresh(){const d=await(await fetch('http://localhost:"""+str(PORT)+r"""/api/data')).json();render(d)}
+(()=>{const t=localStorage.getItem('st-t');if(t)document.body.dataset.theme=t;const r=localStorage.getItem('st-range');if(r)_range=r})();
+
+function setRange(r){
+  _range=r;
+  localStorage.setItem('st-range',r);
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.range===r));
+  if(_allData)render(_allData);
+}
+
+function getDateRange(){
+  const now=new Date();
+  const y=now.getFullYear(),m=now.getMonth(),d=now.getDate();
+  const pad=(n)=>String(n).padStart(2,'0');
+  const fmt=(dt)=>`${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())}`;
+  if(_range==='daily'){
+    const s=fmt(now);
+    return {start:s,end:s,label:`Today — ${s}`};
+  }
+  if(_range==='weekly'){
+    const day=now.getDay()||7; // Mon=1
+    const mon=new Date(y,m,d-day+1);
+    return {start:fmt(mon),end:fmt(now),label:`This Week — ${fmt(mon)} to ${fmt(now)}`};
+  }
+  if(_range==='monthly'){
+    const s=`${y}-${pad(m+1)}-01`;
+    return {start:s,end:fmt(now),label:`${now.toLocaleString('en',{month:'long'})} ${y}`};
+  }
+  return {start:'2000-01-01',end:'2099-12-31',label:'All Time'};
+}
+
+async function refresh(){
+  const d=await(await fetch('http://localhost:"""+str(PORT)+r"""/api/data')).json();
+  _allData=d;
+  // Set active tab on load
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.range===_range));
+  render(d);
+}
+
 function render(d){
-  const{daily,totals:T,anti_estimator:ae,generated_at:ga}=d;
+  const{daily:allDaily,anti_estimator:ae,generated_at:ga,model:mdl}=d;
+  const dr=getDateRange();
+  const daily=allDaily.filter(x=>x.date>=dr.start&&x.date<=dr.end);
+
+  // Compute totals for filtered range
+  let T={codex_cost:0,codex_tokens:0,anti_cost:0,anti_tokens:0,total_cost:0,total_tokens:0};
+  daily.forEach(x=>{
+    if(x.codex){T.codex_cost+=x.codex.cost;T.codex_tokens+=x.codex.total_tokens}
+    if(x.antigravity){T.anti_cost+=x.antigravity.cost;T.anti_tokens+=x.antigravity.total_tokens}
+  });
+  T.total_cost=T.codex_cost+T.anti_cost;T.total_tokens=T.codex_tokens+T.anti_tokens;
+
   document.getElementById('st').innerHTML=ae.running?'<span class="bd on"><span class="dt"></span>Estimator</span>':'<span class="bd off"><span class="dt"></span>Estimator off</span>';
   document.getElementById('ts').textContent=ga;
+  document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
+  document.getElementById('mdl').innerHTML=mdl?`Model: <span>${mdl}</span>`:'';
+
+  const tokLabel=T.total_tokens>=1e9?`${(T.total_tokens/1e9).toFixed(2)}B`:T.total_tokens>=1e6?`${(T.total_tokens/1e6).toFixed(1)}M`:F(T.total_tokens);
   document.getElementById('cds').innerHTML=`
-    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${F(T.total_tokens)} tok</div></div>
+    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${tokLabel} tok</div></div>
     <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div><div class="sb">${F(T.codex_tokens)} tok</div></div>
     <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div><div class="sb">~${F(T.anti_tokens)} tok</div></div>
-    <div class="gl cd k"><div class="gw"></div><div class="lb">Token Volume</div><div class="vl">${(T.total_tokens/1e9).toFixed(2)}B</div><div class="sb">${daily.length} days</div></div>`;
-  const rc=daily.slice(-14),mx=Math.max(...rc.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
-  document.getElementById('ch').innerHTML=rc.map(d=>{
+    <div class="gl cd k"><div class="gw"></div><div class="lb">Token Volume</div><div class="vl">${tokLabel}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>`;
+
+  const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
+  document.getElementById('ch').innerHTML=daily.map(d=>{
     const cc=d.codex?.cost||0,ac=d.antigravity?.cost||0,ch=Math.max(2,cc/mx*190),ah=Math.max(ac>0?2:0,ac/mx*190);
     return`<div class="bg"><div class="gl tp"><div style="font-weight:600;margin-bottom:4px">${d.date}</div><div style="color:var(--green)">Codex: ${C(cc)}</div><div style="color:var(--orange)">Anti: ${C(ac)}</div><div style="margin-top:4px;font-weight:600">Total: ${C(cc+ac)}</div></div>${ac>0?`<div class="br ax" style="height:${ah}px"></div>`:''}${cc>0?`<div class="br cx" style="height:${ch}px"></div>`:''}<span class="bd2">${d.date.slice(5)}</span></div>`}).join('');
+
   let r='';
   daily.slice().reverse().forEach(d=>{
     if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.slice(0,2).join(', ')}</td><td style="text-align:right">${F(c.input_tokens+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${F(c.total_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
