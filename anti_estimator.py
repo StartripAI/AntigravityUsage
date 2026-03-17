@@ -74,17 +74,50 @@ MODELS = {
 }
 DEFAULT_MODEL = "gemini-3.1-pro-high"
 
-# === API Traffic Ratio ===
+# === API Traffic Ratio (SEPARATE for each direction) ===
 # nettop captures ALL language_server traffic (telemetry, file sync, extensions, etc.)
-# Only ~17% is actual API calls to daily-cloudcode-pa.googleapis.com
-# Calibrated: tcpdump API-only = 132MB vs nettop total = 758MB → ratio = 0.174
-API_TRAFFIC_RATIO = 0.174
+# tcpdump calibration (1006 bursts over 19h) shows:
+#   OUTBOUND: tcpdump 228MB / nettop 757MB = 30.1% is API (you → googleapis)
+#   INBOUND:  tcpdump 12MB  / nettop 1232MB = 1.0% is API (googleapis → you)
+# The massive asymmetry is because inbound has UI assets, code index, extensions
+API_RATIO_OUT = 0.30   # 30% of outbound nettop traffic is API requests
+API_RATIO_IN  = 0.01   # 1% of inbound nettop traffic is API responses
 
 # === Noise Filter ===
 # Idle traffic (heartbeats, telemetry, indexing) generates ~2MB/hour.
 # Real API requests are 200KB-1.6MB per 30s interval.
 # Skip any delta below this threshold (combined in+out bytes per poll).
 MIN_DELTA_BYTES = 100_000  # 100KB — below this is idle noise
+
+# === User Tier / Quota Cap ===
+# Antigravity subscription tiers with daily cost caps
+# This prevents wild over-estimation from exceeding what the plan allows
+TIER_FILE = LOG_DIR / "tier_config.json"
+TIERS = {
+    "free":       {"name": "Free",                "daily_hours": 0.5,  "daily_cap_usd": 5},
+    "pro":        {"name": "Pro ($19/mo)",         "daily_hours": 2,    "daily_cap_usd": 20},
+    "ultra":      {"name": "Ultra ($249/mo)",      "daily_hours": 5,    "daily_cap_usd": 60},
+    "enterprise": {"name": "Enterprise",           "daily_hours": 10,   "daily_cap_usd": 150},
+    "unlimited":  {"name": "Unlimited (no cap)",   "daily_hours": 24,   "daily_cap_usd": 99999},
+}
+DEFAULT_TIER = "ultra"  # Google AI Ultra plan
+
+def _load_tier():
+    if TIER_FILE.exists():
+        try:
+            with open(TIER_FILE) as f:
+                data = json.load(f)
+            tid = data.get("tier", DEFAULT_TIER)
+            if tid in TIERS:
+                return tid, TIERS[tid]
+        except Exception:
+            pass
+    return DEFAULT_TIER, TIERS[DEFAULT_TIER]
+
+def _save_tier(tier_id):
+    ensure_dir()
+    with open(TIER_FILE, "w") as f:
+        json.dump({"tier": tier_id, "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
 
 # === Calibration ===
 # bytes-to-token ratio at TCP payload level
@@ -174,11 +207,10 @@ def get_nettop_snapshot():
 def estimate_tokens(delta_bytes_in, delta_bytes_out):
     """Estimate token counts from network byte deltas.
     
-    Applies API_TRAFFIC_RATIO to account for non-API traffic in nettop data.
+    Applies SEPARATE API ratios for outbound (30%) and inbound (1%).
     """
-    # Only ~17% of nettop traffic is actual API calls
-    api_bytes_out = delta_bytes_out * API_TRAFFIC_RATIO
-    api_bytes_in = delta_bytes_in * API_TRAFFIC_RATIO
+    api_bytes_out = delta_bytes_out * API_RATIO_OUT
+    api_bytes_in = delta_bytes_in * API_RATIO_IN
 
     input_tokens = max(0, int(api_bytes_out / BYTES_OUT_PER_INPUT_TOKEN))
     output_tokens = max(0, int(api_bytes_in / BYTES_IN_PER_OUTPUT_TOKEN))

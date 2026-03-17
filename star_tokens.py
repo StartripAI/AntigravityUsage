@@ -52,6 +52,28 @@ ANTI_MODEL_ID, ANTI_MODEL = _get_current_model()
 ANTI_INPUT_PRICE = ANTI_MODEL["input_price"]
 ANTI_OUTPUT_PRICE = ANTI_MODEL["output_price"]
 
+# Tier / quota cap
+TIER_FILE = Path.home() / ".config" / "anti-tracker" / "tier_config.json"
+TIERS = {
+    "free":       {"name": "Free",                "daily_cap_usd": 5},
+    "pro":        {"name": "Pro ($19/mo)",         "daily_cap_usd": 20},
+    "ultra":      {"name": "Ultra ($249/mo)",      "daily_cap_usd": 60},
+    "enterprise": {"name": "Enterprise",           "daily_cap_usd": 150},
+    "unlimited":  {"name": "Unlimited (no cap)",   "daily_cap_usd": 99999},
+}
+def _get_tier():
+    if TIER_FILE.exists():
+        try:
+            with open(TIER_FILE) as f:
+                tid = json.load(f).get("tier", "ultra")
+            if tid in TIERS:
+                return tid, TIERS[tid]
+        except Exception: pass
+    return "ultra", TIERS["ultra"]
+
+TIER_ID, TIER = _get_tier()
+DAILY_CAP = TIER["daily_cap_usd"]
+
 
 def get_codex_data():
     try:
@@ -83,6 +105,11 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
+    # Apply daily cap
+    for date, d in daily.items():
+        d["raw_cost"] = d["cost"]
+        d["cost"] = min(d["cost"], DAILY_CAP)
+        d["capped"] = d["raw_cost"] > DAILY_CAP
     return dict(daily)
 
 
@@ -130,6 +157,7 @@ def build_api_response():
                 "input_tokens": ad["input_tokens"], "output_tokens": ad["output_tokens"],
                 "total_tokens": at, "cost": round(ac, 2), "bytes_in": ad["bytes_in"], "bytes_out": ad["bytes_out"],
                 "model": ANTI_MODEL["name"], "estimated": True,
+                "capped": ad.get("capped", False), "raw_cost": round(ad.get("raw_cost", ac), 2),
             }
         combined.append(entry)
     return {
