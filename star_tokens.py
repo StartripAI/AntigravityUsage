@@ -52,27 +52,44 @@ ANTI_MODEL_ID, ANTI_MODEL = _get_current_model()
 ANTI_INPUT_PRICE = ANTI_MODEL["input_price"]
 ANTI_OUTPUT_PRICE = ANTI_MODEL["output_price"]
 
-# Tier / quota cap
-TIER_FILE = Path.home() / ".config" / "anti-tracker" / "tier_config.json"
-TIERS = {
-    "free":       {"name": "Free",                "daily_cap_usd": 5},
-    "pro":        {"name": "Pro ($19/mo)",         "daily_cap_usd": 20},
-    "ultra":      {"name": "Ultra ($249/mo)",      "daily_cap_usd": 60},
-    "enterprise": {"name": "Enterprise",           "daily_cap_usd": 150},
-    "unlimited":  {"name": "Unlimited (no cap)",   "daily_cap_usd": 99999},
-}
-def _get_tier():
-    if TIER_FILE.exists():
-        try:
-            with open(TIER_FILE) as f:
-                tid = json.load(f).get("tier", "ultra")
-            if tid in TIERS:
-                return tid, TIERS[tid]
-        except Exception: pass
-    return "ultra", TIERS["ultra"]
+# Quota-Based Cost Model 
+# Quota moves in 20% steps. Each 20% = $COST_PER_20PCT in subscription value.
+QUOTA_CONFIG = Path.home() / ".config" / "anti-tracker" / "quota_price.json"
+QUOTA_LOG = Path.home() / ".config" / "anti-tracker" / "quota_snapshots.jsonl"
 
-TIER_ID, TIER = _get_tier()
-DAILY_CAP = TIER["daily_cap_usd"]
+def _get_quota_price():
+    if QUOTA_CONFIG.exists():
+        try:
+            with open(QUOTA_CONFIG) as f:
+                return json.load(f).get("cost_per_20pct", 10.0)
+        except Exception: pass
+    return 10.0  # $10 per 20% tier → $50 for full 100%
+
+COST_PER_20PCT = _get_quota_price()
+
+def get_quota_cost_for_date(date_str):
+    """Calculate Anti cost from quota snapshots for a given date.
+    
+    Reads quota snapshots, finds the max used% for the date,
+    and returns interpolated cost based on configurable $/20% rate.
+    """
+    max_used = 0.0
+    if QUOTA_LOG.exists():
+        with open(QUOTA_LOG) as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        snap = json.loads(line)
+                        if snap["timestamp"].startswith(date_str):
+                            used = snap.get("primary_used_pct", 0)
+                            if used > max_used:
+                                max_used = used
+                    except Exception:
+                        continue
+    # Interpolate: each 20% tier = COST_PER_20PCT
+    # If used=60%, that's 3 tiers × $10 = $30
+    tiers_used = max_used / 20.0
+    return round(tiers_used * COST_PER_20PCT, 2), max_used
 
 
 def get_codex_data():
@@ -105,11 +122,18 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
-    # Apply daily cap
+    # Apply quota-based cost cap
     for date, d in daily.items():
+        quota_cost, used_pct = get_quota_cost_for_date(date)
         d["raw_cost"] = d["cost"]
-        d["cost"] = min(d["cost"], DAILY_CAP)
-        d["capped"] = d["raw_cost"] > DAILY_CAP
+        d["quota_used_pct"] = used_pct
+        if quota_cost > 0:
+            d["cost"] = quota_cost  # Use quota-derived cost instead of nettop estimate
+            d["capped"] = True
+        else:
+            # No quota data, use nettop estimate but cap at 100% = 5 tiers × $10
+            d["cost"] = min(d["cost"], COST_PER_20PCT * 5)
+            d["capped"] = d["raw_cost"] > COST_PER_20PCT * 5
     return dict(daily)
 
 
@@ -179,6 +203,7 @@ def build_api_response():
                 "total_tokens": at, "cost": round(ac, 2), "bytes_in": ad["bytes_in"], "bytes_out": ad["bytes_out"],
                 "model": ANTI_MODEL["name"], "estimated": True,
                 "capped": ad.get("capped", False), "raw_cost": round(ad.get("raw_cost", ac), 2),
+                "quota_used_pct": ad.get("quota_used_pct", 0),
             }
         combined.append(entry)
     return {
@@ -404,8 +429,8 @@ function render(d){
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
   document.getElementById('cds').innerHTML=`
     <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · API Value</div><div class="vl">${C(T.codex_cost)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Quota</div><div class="vl">${C(T.anti_cost)}</div></div>
     <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Input Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalIn)}</div></div>
     <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div></div>
     <div class="gl cd" style="--accent:#f59e0b"><div class="gw" style="background:#f59e0b"></div><div class="lb">Output Tokens</div><div class="vl" style="color:#fbbf24">${fmtTok(totalOut)}</div></div>`;

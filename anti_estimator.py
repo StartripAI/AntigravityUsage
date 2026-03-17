@@ -89,35 +89,54 @@ API_RATIO_IN  = 0.01   # 1% of inbound nettop traffic is API responses
 # Skip any delta below this threshold (combined in+out bytes per poll).
 MIN_DELTA_BYTES = 100_000  # 100KB — below this is idle noise
 
-# === User Tier / Quota Cap ===
-# Antigravity subscription tiers with daily cost caps
-# This prevents wild over-estimation from exceeding what the plan allows
-TIER_FILE = LOG_DIR / "tier_config.json"
-TIERS = {
-    "free":       {"name": "Free",                "daily_hours": 0.5,  "daily_cap_usd": 5},
-    "pro":        {"name": "Pro ($19/mo)",         "daily_hours": 2,    "daily_cap_usd": 20},
-    "ultra":      {"name": "Ultra ($249/mo)",      "daily_hours": 5,    "daily_cap_usd": 60},
-    "enterprise": {"name": "Enterprise",           "daily_hours": 10,   "daily_cap_usd": 150},
-    "unlimited":  {"name": "Unlimited (no cap)",   "daily_hours": 24,   "daily_cap_usd": 99999},
-}
-DEFAULT_TIER = "ultra"  # Google AI Ultra plan
+# === Quota-Based Cost Model ===
+# Antigravity quotas only move in 20% increments: 0/20/40/60/80/100
+# Each 20% tier is 1/5 of the 5-hour window
+# We log quota snapshots to compute daily usage
+QUOTA_LOG = LOG_DIR / "quota_snapshots.jsonl"
 
-def _load_tier():
-    if TIER_FILE.exists():
+# Configurable cost-per-20% tier (subscription value, not API retail)
+# User can set this based on their plan price
+QUOTA_CONFIG_FILE = LOG_DIR / "quota_price.json"
+DEFAULT_COST_PER_20PCT = 10.0  # $10 per 20% tier → $50 for 100%
+
+def _load_quota_price():
+    if QUOTA_CONFIG_FILE.exists():
         try:
-            with open(TIER_FILE) as f:
-                data = json.load(f)
-            tid = data.get("tier", DEFAULT_TIER)
-            if tid in TIERS:
-                return tid, TIERS[tid]
+            with open(QUOTA_CONFIG_FILE) as f:
+                return json.load(f).get("cost_per_20pct", DEFAULT_COST_PER_20PCT)
         except Exception:
             pass
-    return DEFAULT_TIER, TIERS[DEFAULT_TIER]
+    return DEFAULT_COST_PER_20PCT
 
-def _save_tier(tier_id):
-    ensure_dir()
-    with open(TIER_FILE, "w") as f:
-        json.dump({"tier": tier_id, "changed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+def poll_quota():
+    """Poll tu antigravity --json and log quota snapshot if changed."""
+    try:
+        result = subprocess.run(
+            ["tu", "antigravity", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        # Build snapshot: take the PRIMARY model's used %
+        snapshot = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "plan": data.get("plan_type", "Unknown"),
+            "primary_used_pct": data.get("primary_used_percent", 0),
+            "models": [{
+                "label": m["label"],
+                "remaining": round(m["remaining_fraction"] * 100, 1),
+                "reset_time": m.get("reset_time", 0),
+            } for m in data.get("models", [])],
+        }
+        # Log to file
+        ensure_dir()
+        with open(QUOTA_LOG, "a") as f:
+            f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+        return snapshot
+    except Exception:
+        return None
 
 # === Calibration ===
 # bytes-to-token ratio at TCP payload level
