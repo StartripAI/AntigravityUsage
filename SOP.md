@@ -43,12 +43,15 @@
 ```
 
 #### 正确算法
-```
+```text
 1. 读 ~/.codex/state_5.sqlite 的 threads 表
 2. 按 (日期, title) 分组 ← 日期用 created_at 的 UTC 日期
 3. 每组取 MAX(tokens_used)
 4. 计算 dedup_ratio = deduped / raw
-5. 用此 ratio 缩放 tu 的所有字段（tokens + cost）
+5. 用此 ratio 缩放 tu 的【所有】字段：
+   - input_tokens, cache_read_input_tokens, output_tokens
+   - reasoning_output_tokens, total_tokens, cost_usd
+   - 必须全部同步缩放，不得只缩放 cost 而保留原始 token 数
 ```
 
 #### 每日数据隔离（必须遵守）
