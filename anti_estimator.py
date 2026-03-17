@@ -80,9 +80,15 @@ DEFAULT_MODEL = "gemini-3.1-pro-high"
 # Calibrated: tcpdump API-only = 132MB vs nettop total = 758MB → ratio = 0.174
 API_TRAFFIC_RATIO = 0.174
 
+# === Noise Filter ===
+# Idle traffic (heartbeats, telemetry, indexing) generates ~2MB/hour.
+# Real API requests are 200KB-1.6MB per 30s interval.
+# Skip any delta below this threshold (combined in+out bytes per poll).
+MIN_DELTA_BYTES = 100_000  # 100KB — below this is idle noise
+
 # === Calibration ===
 # bytes-to-token ratio at TCP payload level
-# Calibrated via tcpdump: 328 bursts, 290+ real pairs
+# Calibrated via tcpdump: 1006 bursts, 740 real pairs
 CAL_FILE = LOG_DIR / "calibration_result.json"
 _DEFAULT_BPT = 4.0  # bytes per token (both directions)
 
@@ -251,6 +257,11 @@ def daemon_loop():
 
         # Skip if no traffic
         if delta_in == 0 and delta_out == 0:
+            prev = curr
+            continue
+
+        # Noise filter: skip idle heartbeats/telemetry
+        if (delta_in + delta_out) < MIN_DELTA_BYTES:
             prev = curr
             continue
 
