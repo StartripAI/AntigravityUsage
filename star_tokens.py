@@ -265,7 +265,6 @@ tr:hover td{background:rgba(108,99,255,0.03)}
   </div>
   <div class="range-row">
     <div class="range-label" id="rl"></div>
-    <div class="range-label" id="mdl"></div>
   </div>
   <div class="cds" id="cds"></div>
   <div class="gl sc">
@@ -337,7 +336,6 @@ function render(d){
   document.getElementById('st').innerHTML=ae.running?'<span class="bd on"><span class="dt"></span>Estimator</span>':'<span class="bd off"><span class="dt"></span>Estimator off</span>';
   document.getElementById('ts').textContent=ga;
   document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
-  document.getElementById('mdl').innerHTML=mdl?`Model: <span>${mdl}</span>`:'';
 
   const tokLabel=T.total_tokens>=1e9?`${(T.total_tokens/1e9).toFixed(2)}B`:T.total_tokens>=1e6?`${(T.total_tokens/1e6).toFixed(1)}M`:F(T.total_tokens);
   document.getElementById('cds').innerHTML=`
