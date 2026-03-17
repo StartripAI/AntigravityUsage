@@ -207,12 +207,12 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .range-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
 .range-label{font-size:14px;color:var(--t2);font-weight:500;font-family:'JetBrains Mono',monospace}
 .range-label span{color:var(--text);font-weight:700}
-.cds{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}
-.cd{padding:22px;position:relative;overflow:hidden}
-.cd .lb{font-size:11px;color:var(--t2);text-transform:uppercase;letter-spacing:1.2px;font-weight:600;margin-bottom:10px}
-.cd .vl{font-size:30px;font-weight:800;font-family:'JetBrains Mono',monospace;line-height:1.1}
-.cd .sb{font-size:12px;color:var(--t3);margin-top:6px;font-family:'JetBrains Mono',monospace}
-.cd .gw{position:absolute;width:120px;height:120px;border-radius:50%;filter:blur(50px);opacity:0.15;top:-20px;right:-20px}
+.cds{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px}
+.cd{padding:16px;position:relative;overflow:hidden}
+.cd .lb{font-size:10px;color:var(--t2);text-transform:uppercase;letter-spacing:1.2px;font-weight:600;margin-bottom:6px}
+.cd .vl{font-size:22px;font-weight:800;font-family:'JetBrains Mono',monospace;line-height:1.1}
+.cd .sb{font-size:11px;color:var(--t3);margin-top:4px;font-family:'JetBrains Mono',monospace}
+.cd .gw{position:absolute;width:100px;height:100px;border-radius:50%;filter:blur(50px);opacity:0.15;top:-20px;right:-20px}
 .cd.t .vl{background:linear-gradient(135deg,var(--accent),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}.cd.t .gw{background:var(--accent)}
 .cd.c .vl{color:var(--green)}.cd.c .gw{background:var(--green)}
 .cd.a .vl{color:var(--orange)}.cd.a .gw{background:var(--orange)}
@@ -342,10 +342,12 @@ function render(d){
 
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
   document.getElementById('cds').innerHTML=`
-    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${fmtTok(totalIn+totalOut)} tok</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div><div class="sb">${fmtTok(T.codex_in)} in · ${fmtTok(T.codex_out)} out</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div><div class="sb">~${fmtTok(T.anti_in)} in · ~${fmtTok(T.anti_out)} out</div></div>
-    <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>`;
+    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div></div>
+    <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Input Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalIn)}</div></div>
+    <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div></div>
+    <div class="gl cd" style="--accent:#f59e0b"><div class="gw" style="background:#f59e0b"></div><div class="lb">Output Tokens</div><div class="vl" style="color:#fbbf24">${fmtTok(totalOut)}</div></div>`;
 
   const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
   document.getElementById('ch').innerHTML=daily.map(d=>{
