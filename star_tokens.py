@@ -95,11 +95,14 @@ def get_quota_cost_for_date(date_str):
 
 
 def _get_codex_dedup_ratios():
-    """Calculate per-day dedup ratio from state_5.sqlite to correct worktree overcounting.
+    """Calculate per-day dedup ratio from state_5.sqlite to correct overcounting.
     
-    Codex worktrees spawn parallel sessions for the same conversation.
-    Sessions with same title created within 5s are duplicates — only max counts.
-    Returns {date_str: ratio} where ratio = deduped_tokens / raw_tokens.
+    Two sources of overcounting:
+    1. Worktrees: same conversation runs in parallel across worktrees
+    2. Restarts: same conversation restarted → new session re-reports ALL accumulated context
+    
+    Fix: group all sessions by TITLE per day, take MAX tokens (the final session
+    has the most accumulated tokens = the real total usage for that conversation).
     """
     import sqlite3
     db_path = Path.home() / ".codex" / "state_5.sqlite"
@@ -108,42 +111,30 @@ def _get_codex_dedup_ratios():
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         rows = conn.execute(
-            "SELECT created_at, tokens_used, title FROM threads ORDER BY title, created_at"
+            "SELECT created_at, tokens_used, title FROM threads"
         ).fetchall()
         conn.close()
     except Exception:
         return {}
     
     from collections import defaultdict
-    # Group sessions: same title within 5s = worktree duplicates
-    groups = []
-    current = []
-    for r in rows:
-        if not current:
-            current = [r]
-        elif r[2] == current[0][2] and abs(r[0] - current[-1][0]) <= 5:
-            current.append(r)
-        else:
-            groups.append(current)
-            current = [r]
-    if current:
-        groups.append(current)
+    from datetime import datetime as _dt, timezone as _tz
     
-    # Per-day: sum of raw vs sum of max-per-group
+    # Group by (day, title) → take max tokens
+    day_title_max = defaultdict(lambda: defaultdict(int))
     day_raw = defaultdict(int)
-    day_deduped = defaultdict(int)
-    for g in groups:
-        from datetime import datetime as _dt, timezone as _tz
-        day = _dt.fromtimestamp(g[0][0], tz=_tz.utc).strftime("%Y-%m-%d")
-        raw = sum(r[1] for r in g)
-        deduped = max(r[1] for r in g)
-        day_raw[day] += raw
-        day_deduped[day] += deduped
+    
+    for created_at, tokens, title in rows:
+        day = _dt.fromtimestamp(created_at, tz=_tz.utc).strftime("%Y-%m-%d")
+        day_raw[day] += tokens
+        if tokens > day_title_max[day][title]:
+            day_title_max[day][title] = tokens
     
     ratios = {}
     for day in day_raw:
+        deduped = sum(day_title_max[day].values())
         if day_raw[day] > 0:
-            ratios[day] = day_deduped[day] / day_raw[day]
+            ratios[day] = deduped / day_raw[day]
     return ratios
 
 
