@@ -246,7 +246,7 @@ tr:hover td{background:rgba(108,99,255,0.03)}
 @media(max-width:900px){.cds{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
-<body data-theme="dark">
+<body data-theme="light">
 <div class="dbg"><div class="orb"></div><div class="orb"></div><div class="orb"></div><div class="orb"></div></div>
 <div class="ct">
   <div class="hd">
@@ -351,7 +351,7 @@ function render(d){
 
   let r='';
   daily.slice().reverse().forEach(d=>{
-    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.slice(0,2).join(', ')}</td><td style="text-align:right">${F(c.input_tokens+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${F(c.total_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
+    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${F(c.total_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
     if(d.antigravity){const a=d.antigravity;r+=`<tr><td>${d.codex?'':d.date}</td><td><span class="tg ax">Anti</span> <span class="tg es">est.</span></td><td style="text-align:right">~${F(a.input_tokens)}</td><td style="text-align:right">~${F(a.output_tokens)}</td><td style="text-align:right">~${F(a.total_tokens)}</td><td style="text-align:right">~${C(a.cost)}</td></tr>`}
   });
   r+=`<tr class="tr"><td>TOTAL</td><td></td><td></td><td></td><td style="text-align:right">${F(T.total_tokens)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
