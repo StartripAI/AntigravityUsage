@@ -119,7 +119,9 @@ def build_api_response():
             entry["codex"] = {
                 "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct, "cost": round(cc, 2), "models": list(cd.get("models", {}).keys()),
+                "total_tokens": ct, "cost": round(cc, 2),
+                "models": sorted(cd.get("models", {}).keys(),
+                                 key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
             }
         if date in anti:
             ad = anti[date]
