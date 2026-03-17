@@ -45,11 +45,17 @@
 #### 正确算法
 ```
 1. 读 ~/.codex/state_5.sqlite 的 threads 表
-2. 按 (日期, title) 分组
+2. 按 (日期, title) 分组 ← 日期用 created_at 的 UTC 日期
 3. 每组取 MAX(tokens_used)
 4. 计算 dedup_ratio = deduped / raw
 5. 用此 ratio 缩放 tu 的所有字段（tokens + cost）
 ```
+
+#### 每日数据隔离（必须遵守）
+- **每天的数据必须独立计算**，不得跨天合并
+- 同一个对话跨天（03-16 开始，03-17 继续）：每天各自独立去重
+- Session 归属日期以 `created_at` UTC 为准
+- 去重 ratio 按天独立计算，不得用全局 ratio 应用到所有天
 
 ### 禁止事项
 - ❌ 不得用 Team 月费 ($25/seat) 反推 daily cost
