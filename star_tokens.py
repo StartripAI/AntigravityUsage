@@ -275,7 +275,7 @@ tr:hover td{background:rgba(108,99,255,0.03)}
   </div>
   <div class="gl sc">
     <h2>Detailed Usage</h2>
-    <table><thead><tr><th>Date</th><th>Provider</th><th style="text-align:right">Input</th><th style="text-align:right">Output</th><th style="text-align:right">Total</th><th style="text-align:right">Cost</th></tr></thead><tbody id="tb"></tbody></table>
+    <table><thead><tr><th>Date</th><th>Provider</th><th style="text-align:right">Input</th><th style="text-align:right">Cached</th><th style="text-align:right">Output</th><th style="text-align:right">Cost</th></tr></thead><tbody id="tb"></tbody></table>
   </div>
   <div class="ft">Star Tokens · Codex via <b>tu</b> (precise) · Antigravity via nettop (est.) · <span id="ts"></span></div>
 </div>
@@ -328,23 +328,24 @@ function render(d){
   const daily=allDaily.filter(x=>x.date>=dr.start&&x.date<=dr.end);
 
   // Compute totals for filtered range
-  let T={codex_cost:0,codex_tokens:0,anti_cost:0,anti_tokens:0,total_cost:0,total_tokens:0};
+  let T={codex_cost:0,codex_in:0,codex_cached:0,codex_out:0,anti_cost:0,anti_in:0,anti_out:0,total_cost:0};
   daily.forEach(x=>{
-    if(x.codex){T.codex_cost+=x.codex.cost;T.codex_tokens+=x.codex.total_tokens}
-    if(x.antigravity){T.anti_cost+=x.antigravity.cost;T.anti_tokens+=x.antigravity.total_tokens}
+    if(x.codex){T.codex_cost+=x.codex.cost;T.codex_in+=x.codex.input_tokens;T.codex_cached+=x.codex.cached_tokens;T.codex_out+=x.codex.output_tokens+x.codex.reasoning_tokens}
+    if(x.antigravity){T.anti_cost+=x.antigravity.cost;T.anti_in+=x.antigravity.input_tokens;T.anti_out+=x.antigravity.output_tokens}
   });
-  T.total_cost=T.codex_cost+T.anti_cost;T.total_tokens=T.codex_tokens+T.anti_tokens;
+  T.total_cost=T.codex_cost+T.anti_cost;
+  const totalIn=T.codex_in+T.anti_in,totalOut=T.codex_out+T.anti_out;
 
   document.getElementById('st').innerHTML=ae.running?'<span class="bd on"><span class="dt"></span>Estimator</span>':'<span class="bd off"><span class="dt"></span>Estimator off</span>';
   document.getElementById('ts').textContent=ga;
   document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
 
-  const tokLabel=T.total_tokens>=1e9?`${(T.total_tokens/1e9).toFixed(2)}B`:T.total_tokens>=1e6?`${(T.total_tokens/1e6).toFixed(1)}M`:F(T.total_tokens);
+  const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
   document.getElementById('cds').innerHTML=`
-    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${tokLabel} tok</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div><div class="sb">${F(T.codex_tokens)} tok</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div><div class="sb">~${F(T.anti_tokens)} tok</div></div>
-    <div class="gl cd k"><div class="gw"></div><div class="lb">Token Volume</div><div class="vl">${tokLabel}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>`;
+    <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${fmtTok(totalIn+totalOut)} tok</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · Precise</div><div class="vl">${C(T.codex_cost)}</div><div class="sb">${fmtTok(T.codex_in)} in · ${fmtTok(T.codex_out)} out</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Est.</div><div class="vl">${C(T.anti_cost)}</div><div class="sb">~${fmtTok(T.anti_in)} in · ~${fmtTok(T.anti_out)} out</div></div>
+    <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>`;
 
   const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
   document.getElementById('ch').innerHTML=daily.map(d=>{
@@ -353,10 +354,10 @@ function render(d){
 
   let r='';
   daily.slice().reverse().forEach(d=>{
-    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${F(c.total_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
-    if(d.antigravity){const a=d.antigravity;r+=`<tr><td>${d.codex?'':d.date}</td><td><span class="tg ax">Anti</span> <span class="tg es">est.</span></td><td style="text-align:right">~${F(a.input_tokens)}</td><td style="text-align:right">~${F(a.output_tokens)}</td><td style="text-align:right">~${F(a.total_tokens)}</td><td style="text-align:right">~${C(a.cost)}</td></tr>`}
+    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens)}</td><td style="text-align:right;color:var(--t3)">${F(c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
+    if(d.antigravity){const a=d.antigravity;r+=`<tr><td>${d.codex?'':d.date}</td><td><span class="tg ax">Anti</span> <span class="tg es">est.</span></td><td style="text-align:right">~${F(a.input_tokens)}</td><td style="text-align:right;color:var(--t3)">—</td><td style="text-align:right">~${F(a.output_tokens)}</td><td style="text-align:right">~${C(a.cost)}</td></tr>`}
   });
-  r+=`<tr class="tr"><td>TOTAL</td><td></td><td></td><td></td><td style="text-align:right">${F(T.total_tokens)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
+  r+=`<tr class="tr"><td>TOTAL</td><td></td><td style="text-align:right">${F(totalIn)}</td><td style="text-align:right;color:var(--t3)">${F(T.codex_cached)}</td><td style="text-align:right">${F(totalOut)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
   document.getElementById('tb').innerHTML=r;
 }
 refresh();setInterval(refresh,30000);
