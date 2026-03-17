@@ -98,7 +98,7 @@ QUOTA_LOG = LOG_DIR / "quota_snapshots.jsonl"
 # Configurable cost-per-20% tier (subscription value, not API retail)
 # User can set this based on their plan price
 QUOTA_CONFIG_FILE = LOG_DIR / "quota_price.json"
-DEFAULT_COST_PER_20PCT = 10.0  # $10 per 20% tier → $50 for 100%
+DEFAULT_COST_PER_20PCT = 50.0  # $50 per 20% tier → $250 for 100%
 
 def _load_quota_price():
     if QUOTA_CONFIG_FILE.exists():

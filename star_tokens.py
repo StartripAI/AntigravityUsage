@@ -63,9 +63,22 @@ def _get_quota_price():
             with open(QUOTA_CONFIG) as f:
                 return json.load(f).get("cost_per_20pct", 10.0)
         except Exception: pass
-    return 10.0  # $10 per 20% tier → $50 for full 100%
+    return 50.0  # $50 per 20% tier → $250 for full 100%
 
 COST_PER_20PCT = _get_quota_price()
+
+# Codex Subscription Plan (for converting retail API cost → subscription cost)
+CODEX_PLAN_FILE = Path.home() / ".config" / "anti-tracker" / "codex_plan.json"
+def _get_codex_plan():
+    if CODEX_PLAN_FILE.exists():
+        try:
+            with open(CODEX_PLAN_FILE) as f:
+                return json.load(f)
+        except Exception: pass
+    return {"seats": 2, "monthly_per_seat": 25}  # 2 Team seats × $25/mo default
+
+CODEX_PLAN = _get_codex_plan()
+CODEX_DAILY_SUB = CODEX_PLAN["seats"] * CODEX_PLAN["monthly_per_seat"] / 30.0
 
 def get_quota_cost_for_date(date_str):
     """Calculate Anti cost from quota snapshots for a given date.
@@ -122,18 +135,14 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
-    # Apply quota-based cost cap
+    # Cap at max subscription value per day (5 tiers × $COST_PER_20PCT)
+    MAX_DAILY = COST_PER_20PCT * 5  # $50 default
     for date, d in daily.items():
-        quota_cost, used_pct = get_quota_cost_for_date(date)
+        _qcost, used_pct = get_quota_cost_for_date(date)
         d["raw_cost"] = d["cost"]
         d["quota_used_pct"] = used_pct
-        if quota_cost > 0:
-            d["cost"] = quota_cost  # Use quota-derived cost instead of nettop estimate
-            d["capped"] = True
-        else:
-            # No quota data, use nettop estimate but cap at 100% = 5 tiers × $10
-            d["cost"] = min(d["cost"], COST_PER_20PCT * 5)
-            d["capped"] = d["raw_cost"] > COST_PER_20PCT * 5
+        d["cost"] = min(d["cost"], MAX_DAILY)
+        d["capped"] = d["raw_cost"] > MAX_DAILY
     return dict(daily)
 
 
@@ -191,7 +200,8 @@ def build_api_response():
             entry["codex"] = {
                 "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct, "cost": round(cc, 2),
+                "total_tokens": ct, "cost": round(min(cc, CODEX_DAILY_SUB), 2),
+                "retail_cost": round(cc, 2),
                 "models": sorted(cd.get("models", {}).keys(),
                                  key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
             }
