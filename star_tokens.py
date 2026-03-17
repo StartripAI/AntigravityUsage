@@ -106,11 +106,75 @@ def get_quota_cost_for_date(date_str):
     return round(tiers_used * COST_PER_20PCT, 2), max_used
 
 
+def _get_codex_dedup_ratios():
+    """Calculate per-day dedup ratio from state_5.sqlite to correct worktree overcounting.
+    
+    Codex worktrees spawn parallel sessions for the same conversation.
+    Sessions with same title created within 5s are duplicates — only max counts.
+    Returns {date_str: ratio} where ratio = deduped_tokens / raw_tokens.
+    """
+    import sqlite3
+    db_path = Path.home() / ".codex" / "state_5.sqlite"
+    if not db_path.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT created_at, tokens_used, title FROM threads ORDER BY title, created_at"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+    
+    from collections import defaultdict
+    # Group sessions: same title within 5s = worktree duplicates
+    groups = []
+    current = []
+    for r in rows:
+        if not current:
+            current = [r]
+        elif r[2] == current[0][2] and abs(r[0] - current[-1][0]) <= 5:
+            current.append(r)
+        else:
+            groups.append(current)
+            current = [r]
+    if current:
+        groups.append(current)
+    
+    # Per-day: sum of raw vs sum of max-per-group
+    day_raw = defaultdict(int)
+    day_deduped = defaultdict(int)
+    for g in groups:
+        from datetime import datetime, timezone
+        day = datetime.fromtimestamp(g[0][0], tz=timezone.utc).strftime("%Y-%m-%d")
+        raw = sum(r[1] for r in g)
+        deduped = max(r[1] for r in g)
+        day_raw[day] += raw
+        day_deduped[day] += deduped
+    
+    ratios = {}
+    for day in day_raw:
+        if day_raw[day] > 0:
+            ratios[day] = day_deduped[day] / day_raw[day]
+    return ratios
+
+
 def get_codex_data():
     try:
         result = subprocess.run(["tu", "daily", "--json"], capture_output=True, text=True, timeout=15)
         if result.returncode == 0:
-            return json.loads(result.stdout)
+            data = json.loads(result.stdout)
+            # Apply worktree dedup ratios to correct overcounting
+            ratios = _get_codex_dedup_ratios()
+            for day in data.get("daily", []):
+                r = ratios.get(day.get("date", ""), 1.0)
+                if r < 1.0:
+                    t = day.get("totals", {})
+                    for k in ["input_tokens", "cache_read_input_tokens", "output_tokens",
+                              "reasoning_output_tokens", "total_tokens", "cost_usd"]:
+                        if k in t:
+                            t[k] = round(t[k] * r) if "token" in k else round(t[k] * r, 4)
+            return data
     except Exception:
         pass
     return {"daily": []}
