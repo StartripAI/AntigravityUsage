@@ -67,20 +67,7 @@ def _get_quota_price():
 
 COST_PER_20PCT = _get_quota_price()
 
-# Codex Subscription Plan
-# User has multiple Team plans; cost is subscription-based, not retail API
-CODEX_PLAN_FILE = Path.home() / ".config" / "anti-tracker" / "codex_plan.json"
-def _get_codex_plan():
-    if CODEX_PLAN_FILE.exists():
-        try:
-            with open(CODEX_PLAN_FILE) as f:
-                return json.load(f)
-        except Exception: pass
-    # 3 Team plans × $50 per 5h window = $150/day
-    return {"plans": 3, "cost_per_window": 50}
 
-CODEX_PLAN = _get_codex_plan()
-CODEX_DAILY_CAP = CODEX_PLAN.get("plans", 3) * CODEX_PLAN.get("cost_per_window", 50)
 
 def get_quota_cost_for_date(date_str):
     """Calculate Anti cost from quota snapshots for a given date.
@@ -266,9 +253,7 @@ def build_api_response():
             entry["codex"] = {
                 "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct,
-                "cost": round(min(cc, CODEX_DAILY_CAP), 2),
-                "retail_cost": round(cc, 2),
+                "total_tokens": ct, "cost": round(cc, 2),
                 "models": sorted(cd.get("models", {}).keys(),
                                  key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
             }
