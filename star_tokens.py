@@ -201,7 +201,7 @@ def build_api_response():
             entry["codex"] = {
                 "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct, "retail_cost": round(cc, 2),
+                "total_tokens": ct, "cost": round(cc, 2),
                 "models": sorted(cd.get("models", {}).keys(),
                                  key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
             }
@@ -216,13 +216,6 @@ def build_api_response():
                 "quota_used_pct": ad.get("quota_used_pct", 0),
             }
         combined.append(entry)
-    # Proportional Codex cost: scale retail to subscription budget
-    # Heaviest day → CODEX_DAILY_CAP, others proportional
-    max_retail = max((e["codex"]["retail_cost"] for e in combined if e["codex"]), default=1) or 1
-    for entry in combined:
-        if entry["codex"]:
-            rc = entry["codex"]["retail_cost"]
-            entry["codex"]["cost"] = round(rc / max_retail * CODEX_DAILY_CAP, 2)
     return {
         "daily": combined,
         "anti_estimator": anti_status,
@@ -446,7 +439,7 @@ function render(d){
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
   document.getElementById('cds').innerHTML=`
     <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex · API Value</div><div class="vl">${C(T.codex_cost)}</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex</div><div class="vl">${C(T.codex_cost)}</div></div>
     <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Quota</div><div class="vl">${C(T.anti_cost)}</div></div>
     <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Input Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalIn)}</div></div>
     <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div></div>
