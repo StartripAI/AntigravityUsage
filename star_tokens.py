@@ -75,10 +75,11 @@ def _get_codex_plan():
             with open(CODEX_PLAN_FILE) as f:
                 return json.load(f)
         except Exception: pass
-    return {"seats": 2, "monthly_per_seat": 25}  # 2 Team seats × $25/mo default
+    # User has 2 Team plans; 100% of 5h on both ≈ $100/day value
+    return {"daily_cap_usd": 100}
 
 CODEX_PLAN = _get_codex_plan()
-CODEX_DAILY_SUB = CODEX_PLAN["seats"] * CODEX_PLAN["monthly_per_seat"] / 30.0
+CODEX_DAILY_CAP = CODEX_PLAN.get("daily_cap_usd", 100)
 
 def get_quota_cost_for_date(date_str):
     """Calculate Anti cost from quota snapshots for a given date.
@@ -200,8 +201,7 @@ def build_api_response():
             entry["codex"] = {
                 "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
                 "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct, "cost": round(min(cc, CODEX_DAILY_SUB), 2),
-                "retail_cost": round(cc, 2),
+                "total_tokens": ct, "retail_cost": round(cc, 2),
                 "models": sorted(cd.get("models", {}).keys(),
                                  key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
             }
@@ -216,6 +216,13 @@ def build_api_response():
                 "quota_used_pct": ad.get("quota_used_pct", 0),
             }
         combined.append(entry)
+    # Proportional Codex cost: scale retail to subscription budget
+    # Heaviest day → CODEX_DAILY_CAP, others proportional
+    max_retail = max((e["codex"]["retail_cost"] for e in combined if e["codex"]), default=1) or 1
+    for entry in combined:
+        if entry["codex"]:
+            rc = entry["codex"]["retail_cost"]
+            entry["codex"]["cost"] = round(rc / max_retail * CODEX_DAILY_CAP, 2)
     return {
         "daily": combined,
         "anti_estimator": anti_status,
