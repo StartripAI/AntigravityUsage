@@ -125,6 +125,27 @@ def get_anti_status():
     return {"running": False, "pid": None}
 
 
+def get_anti_quota():
+    """Fetch live quota from tu antigravity --json"""
+    try:
+        result = subprocess.run(["tu", "antigravity", "--json"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return {
+                "plan": data.get("plan_type", "Unknown"),
+                "email": data.get("account_email", ""),
+                "models": [{
+                    "label": m["label"],
+                    "remaining": round(m["remaining_fraction"] * 100, 1),
+                    "reset_time": m.get("reset_time", 0),
+                } for m in data.get("models", [])],
+                "primary_used": data.get("primary_used_percent", 0),
+            }
+    except Exception:
+        pass
+    return None
+
+
 def build_api_response():
     codex = get_codex_data()
     anti = get_anti_data()
@@ -163,6 +184,7 @@ def build_api_response():
     return {
         "daily": combined,
         "anti_estimator": anti_status,
+        "anti_quota": get_anti_quota(),
         "model": ANTI_MODEL["name"],
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -273,6 +295,16 @@ tr:hover td{background:rgba(108,99,255,0.03)}
 .tr td{font-weight:700;border-top:2px solid var(--gb)}
 .tr td:last-child{background:linear-gradient(135deg,var(--accent),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:15px}
 .ft{text-align:center;padding:20px;font-size:11px;color:var(--t3)}
+.qt{margin-bottom:20px}
+.qt h2{font-size:16px;margin-bottom:14px;font-weight:700}
+.qt h2 span{font-size:12px;font-weight:500;color:var(--t3);margin-left:8px}
+.qm{display:flex;flex-direction:column;gap:8px}
+.qr{display:flex;align-items:center;gap:10px;font-size:12px;font-family:'JetBrains Mono',monospace}
+.qr .ql{width:160px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
+.qr .qb{flex:1;height:16px;background:var(--gb);border-radius:8px;overflow:hidden;position:relative}
+.qr .qf{height:100%;border-radius:8px;transition:width 0.4s ease}
+.qr .qp{width:50px;text-align:right;font-weight:600;flex-shrink:0}
+.qr .qrt{width:80px;text-align:right;color:var(--t3);font-size:10px;flex-shrink:0}
 @media(max-width:900px){.cds{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
@@ -297,6 +329,7 @@ tr:hover td{background:rgba(108,99,255,0.03)}
     <div class="range-label" id="rl"></div>
   </div>
   <div class="cds" id="cds"></div>
+  <div class="gl sc qt" id="quota"></div>
   <div class="gl sc">
     <h2>Daily Cost<div class="lg"><div class="lgi"><div class="lgd" style="background:var(--green)"></div>Codex</div><div class="lgi"><div class="lgd" style="background:var(--orange)"></div>Antigravity</div></div></h2>
     <div class="ch" id="ch"></div>
@@ -389,6 +422,29 @@ function render(d){
   });
   r+=`<tr class="tr"><td>TOTAL</td><td></td><td style="text-align:right">${F(totalIn)}</td><td style="text-align:right;color:var(--t3)">${F(T.codex_cached)}</td><td style="text-align:right">${F(totalOut)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
   document.getElementById('tb').innerHTML=r;
+
+  // Quota section
+  const q=data.anti_quota;
+  if(q){
+    const colors=['#6366f1','#22c55e','#f59e0b','#ec4899','#06b6d4','#8b5cf6'];
+    const now=Date.now()/1000;
+    let qh=`<h2>Antigravity Quota<span>${q.plan} · ${q.email}</span></h2><div class="qm">`;
+    q.models.forEach((m,i)=>{
+      const rem=m.remaining;
+      const used=(100-rem).toFixed(1);
+      const c=colors[i%colors.length];
+      const bg=rem>60?'#22c55e':rem>30?'#f59e0b':'#ef4444';
+      const dt=m.reset_time-now;
+      const rh=Math.floor(dt/3600),rm=Math.floor((dt%3600)/60);
+      const rt=dt>0?`${rh}h${rm}m`:'now';
+      qh+=`<div class="qr"><div class="ql">${m.label}</div><div class="qb"><div class="qf" style="width:${rem}%;background:${bg}"></div></div><div class="qp" style="color:${bg}">${rem}%</div><div class="qrt">↻ ${rt}</div></div>`;
+    });
+    qh+='</div>';
+    document.getElementById('quota').innerHTML=qh;
+    document.getElementById('quota').style.display='';
+  } else {
+    document.getElementById('quota').style.display='none';
+  }
 }
 refresh();setInterval(refresh,30000);
 </script>
