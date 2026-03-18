@@ -179,14 +179,12 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
-    # Cap at max subscription value per day (5 tiers × $COST_PER_20PCT)
-    MAX_DAILY = COST_PER_20PCT * 5  # $50 default
+    # No cap — SOP: always use retail pricing, never cap
     for date, d in daily.items():
         _qcost, used_pct = get_quota_cost_for_date(date)
         d["raw_cost"] = d["cost"]
         d["quota_used_pct"] = used_pct
-        d["cost"] = min(d["cost"], MAX_DAILY)
-        d["capped"] = d["raw_cost"] > MAX_DAILY
+        d["capped"] = False
     return dict(daily)
 
 
