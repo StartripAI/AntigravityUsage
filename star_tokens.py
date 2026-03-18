@@ -549,11 +549,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 def ensure_estimator():
+    """Force-start the estimator daemon. GUI MUST always launch with estimator."""
+    import time
     status = get_anti_status()
-    if not status["running"] and ESTIMATOR_SCRIPT.exists():
+    if status["running"]:
+        print(f"  📡 Antigravity estimator already running (PID {status['pid']})")
+        return
+    # Kill stale PID file
+    pid_file = Path.home() / ".config" / "anti-tracker" / "estimator.pid"
+    if pid_file.exists():
+        pid_file.unlink(missing_ok=True)
+    if not ESTIMATOR_SCRIPT.exists():
+        print("  ⚠️  anti_estimator.py not found!")
+        return
+    # Start and verify (retry once)
+    for attempt in range(2):
         subprocess.Popen([sys.executable, str(ESTIMATOR_SCRIPT), "start"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("  📡 Started Antigravity estimator daemon")
+        time.sleep(2)
+        status = get_anti_status()
+        if status["running"]:
+            print(f"  📡 Started Antigravity estimator daemon (PID {status['pid']})")
+            return
+    print("  ❌ Failed to start estimator daemon after 2 attempts!")
 
 
 def start_api_server():

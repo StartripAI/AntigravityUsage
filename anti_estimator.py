@@ -82,6 +82,7 @@ DEFAULT_MODEL = "gemini-3.1-pro-high"
 # The massive asymmetry is because inbound has UI assets, code index, extensions
 API_RATIO_OUT = 0.30   # 30% of outbound nettop traffic is API requests
 API_RATIO_IN  = 0.01   # 1% of inbound nettop traffic is API responses
+API_TRAFFIC_RATIO = (API_RATIO_OUT + API_RATIO_IN) / 2  # avg for display
 
 # === Noise Filter ===
 # Idle traffic (heartbeats, telemetry, indexing) generates ~2MB/hour.
@@ -276,11 +277,12 @@ def daemon_loop():
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
-    # Get initial snapshot
+    # Wait for language_server to appear (don't exit — GUI depends on this daemon)
     prev = get_nettop_snapshot()
-    if not prev:
-        print("❌ Cannot get nettop data. Is language_server running?")
-        sys.exit(1)
+    while not prev:
+        print("⏳ Waiting for language_server_macos_arm... (retrying in 10s)")
+        time.sleep(10)
+        prev = get_nettop_snapshot()
     save_snapshot(prev)
     print(f"   Initial: {prev['bytes_in']:,} bytes in / {prev['bytes_out']:,} bytes out")
     print(f"   Tracking PIDs: {prev['pids']}")
@@ -357,12 +359,8 @@ def cmd_start():
         except ProcessLookupError:
             PID_FILE.unlink()
 
-    # Check if language_server is running
-    snap = get_nettop_snapshot()
-    if not snap or snap["bytes_in"] == 0 and snap["bytes_out"] == 0:
-        print("❌ No language_server_macos_arm process found.")
-        print("   Make sure Antigravity is running.")
-        return
+    # Note: daemon_loop handles missing language_server gracefully
+    # Do NOT gate startup on language_server being present
 
     print(f"📋 Current model: {CURRENT_MODEL['name']}")
     print(f"   Switch with: python3 {sys.argv[0]} model")
