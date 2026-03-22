@@ -74,14 +74,12 @@ MODELS = {
 }
 DEFAULT_MODEL = "gemini-3.1-pro-high"
 
-# === API Traffic Ratio (SEPARATE for each direction) ===
-# nettop captures ALL language_server traffic (telemetry, file sync, extensions, etc.)
-# tcpdump calibration (1006 bursts over 19h) shows:
-#   OUTBOUND: tcpdump 228MB / nettop 757MB = 30.1% is API (you → googleapis)
-#   INBOUND:  tcpdump 12MB  / nettop 1232MB = 1.0% is API (googleapis → you)
-# The massive asymmetry is because inbound has UI assets, code index, extensions
-API_RATIO_OUT = 0.30   # 30% of outbound nettop traffic is API requests
-API_RATIO_IN  = 0.01   # 1% of inbound nettop traffic is API responses
+# OUTBOUND: calibrated against user's reported quota usage (120-180%/day workday)
+#   Old: tcpdump 228MB / nettop 757MB = 30.1% → produced $889/day (too high)
+#   New: back-calculated from user's ~150% avg workday quota ($375 target)
+#   nettop captures extensions, file sync, telemetry, code index — mostly non-API
+API_RATIO_OUT = 0.10   # 10% of outbound nettop traffic is actual API requests
+API_RATIO_IN  = 0.005  # 0.5% of inbound nettop traffic is API responses
 API_TRAFFIC_RATIO = (API_RATIO_OUT + API_RATIO_IN) / 2  # avg for display
 
 # === Noise Filter ===
@@ -289,9 +287,19 @@ def daemon_loop():
 
     session_in = 0
     session_out = 0
+    poll_count = 0
+    QUOTA_POLL_EVERY = 10  # poll quota every 10 loops = 5 min at 30s interval
+
+    # Initial quota snapshot
+    poll_quota()
 
     while True:
         time.sleep(POLL_INTERVAL)
+        poll_count += 1
+
+        # Poll quota periodically
+        if poll_count % QUOTA_POLL_EVERY == 0:
+            poll_quota()
 
         curr = get_nettop_snapshot()
         if not curr:

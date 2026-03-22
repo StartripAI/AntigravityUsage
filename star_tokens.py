@@ -179,11 +179,17 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
-    # No cap — SOP: always use retail pricing, never cap
+    # Prefer quota-based cost over nettop estimate
+    # Quota is deterministic (actual usage); nettop is noisy (API ratio varies 3x)
     for date, d in daily.items():
-        _qcost, used_pct = get_quota_cost_for_date(date)
-        d["raw_cost"] = d["cost"]
+        quota_cost, used_pct = get_quota_cost_for_date(date)
+        d["raw_cost"] = d["cost"]  # nettop estimate (for reference)
         d["quota_used_pct"] = used_pct
+        if quota_cost > 0:
+            d["cost"] = quota_cost  # quota-based = accurate
+            d["cost_source"] = "quota"
+        else:
+            d["cost_source"] = "nettop"
         d["capped"] = False
     return dict(daily)
 
