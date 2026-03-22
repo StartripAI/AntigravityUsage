@@ -110,31 +110,96 @@ def _load_quota_price():
 
 def poll_quota():
     """Poll tu antigravity --json and log quota snapshot if changed."""
+    import re
+    import ssl
+    import urllib.request
     try:
-        result = subprocess.run(
-            ["tu", "antigravity", "--json"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
+        # 1. Find language_server PID, CSRF token, and random port from ps
+        result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+        servers = []
+        for line in result.stdout.split("\n"):
+            if "language_server_macos" in line and "--csrf_token" in line:
+                csrf = re.search(r"--csrf_token\s+(\S+)", line)
+                if csrf:
+                    servers.append(csrf.group(1))
+        if not servers:
             return None
-        data = json.loads(result.stdout)
-        # Build snapshot: take the PRIMARY model's used %
+
+        # 2. Find random port (language_server listens on HTTPS)
+        #    Get PID of language_server and check its ports
+        result2 = subprocess.run(["pgrep", "-f", "language_server_macos"], capture_output=True, text=True, timeout=5)
+        pids = result2.stdout.strip().split("\n")
+        ls_port = None
+        for pid in pids:
+            if not pid.strip():
+                continue
+            lsof = subprocess.run(["lsof", "-i", "-P", "-n", "-p", pid.strip()],
+                                  capture_output=True, text=True, timeout=5)
+            for line in lsof.stdout.split("\n"):
+                if "LISTEN" in line and "language_" in line:
+                    m = re.search(r":(\d+)\s", line)
+                    if m:
+                        ls_port = int(m.group(1))
+                        break
+            if ls_port:
+                break
+
+        if not ls_port:
+            return None
+
+        csrf_token = servers[0]
+
+        # 3. Call GetUserStatus API
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        url = f"https://127.0.0.1:{ls_port}/exa.language_server_pb.LanguageServerService/GetUserStatus"
+        req = urllib.request.Request(url, data=b'{}', method='POST',  headers={
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": csrf_token,
+        })
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        # 4. Extract quota info from response
+        user_status = data.get("userStatus", {})
+        plan_status = user_status.get("planStatus", {})
+        plan_info = plan_status.get("planInfo", {})
+        cascade = user_status.get("cascadeModelConfigData", {})
+        models_raw = cascade.get("clientModelConfigs", [])
+
+        models = []
+        max_used_pct = 0.0
+        for m in models_raw:
+            qi = m.get("quotaInfo", {})
+            remaining = qi.get("remainingFraction", 1.0)
+            used_pct = round((1.0 - remaining) * 100, 1)
+            if used_pct > max_used_pct:
+                max_used_pct = used_pct
+            models.append({
+                "label": m.get("label", "Unknown"),
+                "remaining": round(remaining * 100, 1),
+                "remaining_fraction": remaining,
+                "reset_time": qi.get("resetTime", ""),
+            })
+
         snapshot = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "plan": data.get("plan_type", "Unknown"),
-            "primary_used_pct": data.get("primary_used_percent", 0),
-            "models": [{
-                "label": m["label"],
-                "remaining": round(m["remaining_fraction"] * 100, 1),
-                "reset_time": m.get("reset_time", 0),
-            } for m in data.get("models", [])],
+            "plan": plan_info.get("planName", user_status.get("userTier", {}).get("name", "Unknown")),
+            "primary_used_pct": max_used_pct,
+            "prompt_credits": plan_status.get("availablePromptCredits", 0),
+            "flow_credits": plan_status.get("availableFlowCredits", 0),
+            "models": models,
         }
         # Log to file
         ensure_dir()
         with open(QUOTA_LOG, "a") as f:
             f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+        print(f"  📊 Quota: {max_used_pct:.0f}% used | {len(models)} models | credits: {snapshot['prompt_credits']}P/{snapshot['flow_credits']}F")
         return snapshot
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠ Quota poll failed: {e}")
         return None
 
 # === Calibration ===
