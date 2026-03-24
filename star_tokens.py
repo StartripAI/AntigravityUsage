@@ -509,12 +509,14 @@ function render(d){
   document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
 
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
-  const totalTok=totalIn+totalOut;
+  const gptTok=T.codex_in+T.codex_cached+T.codex_out,claudeTok=T.anti_in+T.anti_out,totalTok=gptTok+claudeTok;
   document.getElementById('cds').innerHTML=`
     <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
     <div class="gl cd c"><div class="gw"></div><div class="lb">ChatGPT</div><div class="vl">${C(T.codex_cost)}</div></div>
     <div class="gl cd a"><div class="gw"></div><div class="lb">Claude Opus</div><div class="vl">${C(T.anti_cost)}</div></div>
-    <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Total Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalTok)}</div></div>`;
+    <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Total Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalTok)}</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">GPT Tokens</div><div class="vl">${fmtTok(gptTok)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Claude Tokens</div><div class="vl">${fmtTok(claudeTok)}</div></div>`;
 
   const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
   document.getElementById('ch').innerHTML=daily.map(d=>{
