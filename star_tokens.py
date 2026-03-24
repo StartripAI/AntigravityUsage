@@ -72,10 +72,14 @@ COST_PER_20PCT = _get_quota_price()
 def get_quota_cost_for_date(date_str):
     """Calculate Anti cost from quota snapshots for a given date.
     
-    Reads quota snapshots, finds the max used% for the date,
-    and returns interpolated cost based on configurable $/20% rate.
+    Accumulates quota usage across 5h window resets.
+    When usage drops significantly (reset detected), the consumed
+    amount from the previous window is banked and accumulation
+    continues from the new baseline.
+    
+    Example: 80% → reset → 60% → reset → 40% = 80+60+40 = 180% total
     """
-    max_used = 0.0
+    snapshots = []  # (timestamp, used_pct) sorted by time
     if QUOTA_LOG.exists():
         with open(QUOTA_LOG) as f:
             for line in f:
@@ -84,14 +88,35 @@ def get_quota_cost_for_date(date_str):
                         snap = json.loads(line)
                         if snap["timestamp"].startswith(date_str):
                             used = snap.get("primary_used_pct", 0)
-                            if used > max_used:
-                                max_used = used
+                            snapshots.append((snap["timestamp"], used))
                     except Exception:
                         continue
+    if not snapshots:
+        return 0.0, 0.0
+    
+    # Sort by timestamp
+    snapshots.sort(key=lambda x: x[0])
+    
+    # Accumulate across window resets
+    # A "reset" = usage drops by >15% between consecutive snapshots
+    total_consumed = 0.0
+    prev_used = 0.0
+    window_peak = 0.0
+    
+    for _, used in snapshots:
+        if used < prev_used - 15:  # reset detected (usage dropped significantly)
+            total_consumed += window_peak  # bank the peak of the ended window
+            window_peak = used  # start new window tracking
+        else:
+            window_peak = max(window_peak, used)
+        prev_used = used
+    
+    # Add current window's peak
+    total_consumed += window_peak
+    
     # Interpolate: each 20% tier = COST_PER_20PCT
-    # If used=60%, that's 3 tiers × $10 = $30
-    tiers_used = max_used / 20.0
-    return round(tiers_used * COST_PER_20PCT, 2), max_used
+    tiers_used = total_consumed / 20.0
+    return round(tiers_used * COST_PER_20PCT, 2), total_consumed
 
 
 def _get_codex_dedup_ratios():
@@ -484,13 +509,12 @@ function render(d){
   document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
 
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
+  const totalTok=totalIn+totalOut;
   document.getElementById('cds').innerHTML=`
     <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex</div><div class="vl">${C(T.codex_cost)}</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity · Quota</div><div class="vl">${C(T.anti_cost)}</div></div>
-    <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Input Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalIn)}</div></div>
-    <div class="gl cd k"><div class="gw"></div><div class="lb">Cached Tokens</div><div class="vl">${fmtTok(T.codex_cached)}</div></div>
-    <div class="gl cd" style="--accent:#f59e0b"><div class="gw" style="background:#f59e0b"></div><div class="lb">Output Tokens</div><div class="vl" style="color:#fbbf24">${fmtTok(totalOut)}</div></div>`;
+    <div class="gl cd c"><div class="gw"></div><div class="lb">ChatGPT</div><div class="vl">${C(T.codex_cost)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Claude Opus</div><div class="vl">${C(T.anti_cost)}</div></div>
+    <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Total Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalTok)}</div></div>`;
 
   const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
   document.getElementById('ch').innerHTML=daily.map(d=>{
