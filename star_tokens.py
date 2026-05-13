@@ -17,14 +17,31 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+from anti_estimator import select_primary_quota_model, used_pct_from_quota_model
 
 PORT = 18877  # Internal port for API
 ANTI_LOG = Path.home() / ".config" / "anti-tracker" / "nettop_usage.jsonl"
 MODEL_FILE = Path.home() / ".config" / "anti-tracker" / "current_model.json"
 ESTIMATOR_SCRIPT = Path(__file__).parent / "anti_estimator.py"
+CLAUDE_PROJECT_DIRS = [
+    Path.home() / ".config" / "claude" / "projects",
+    Path.home() / ".claude" / "projects",
+]
+TOKEN_FIELDS = [
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+]
+COST_FIELDS = ["cost_usd"]
 
 # Load model info
 MODELS = {
@@ -66,10 +83,24 @@ def _get_quota_price():
     return 50.0  # $50 per 20% tier → $250 for full 100%
 
 COST_PER_20PCT = _get_quota_price()
+_CLAUDE_VALIDATION_CACHE = {"at": 0.0, "value": None}
+_CLAUDE_LOCAL_CACHE = {"at": 0.0, "value": None}
+CLAUDE_MISMATCH_THRESHOLD_PCT = 2.0
 
 
+def _safe_number(value, default=0):
+    return value if isinstance(value, (int, float)) else default
 
-def get_quota_cost_for_date(date_str):
+
+def _snapshot_primary_used_pct(snapshot):
+    models = snapshot.get("models", [])
+    primary = select_primary_quota_model(models)
+    if primary:
+        return used_pct_from_quota_model(primary)
+    return float(snapshot.get("primary_used_pct") or 0.0)
+
+
+def get_quota_usage_for_date(date_str):
     """Calculate Anti cost from quota snapshots for a given date.
     
     Accumulates quota usage across 5h window resets.
@@ -87,12 +118,12 @@ def get_quota_cost_for_date(date_str):
                     try:
                         snap = json.loads(line)
                         if snap["timestamp"].startswith(date_str):
-                            used = snap.get("primary_used_pct", 0)
+                            used = _snapshot_primary_used_pct(snap)
                             snapshots.append((snap["timestamp"], used))
                     except Exception:
                         continue
     if not snapshots:
-        return 0.0, 0.0
+        return 0.0, 0.0, False
     
     # Sort by timestamp
     snapshots.sort(key=lambda x: x[0])
@@ -116,7 +147,12 @@ def get_quota_cost_for_date(date_str):
     
     # Interpolate: each 20% tier = COST_PER_20PCT
     tiers_used = total_consumed / 20.0
-    return round(tiers_used * COST_PER_20PCT, 2), total_consumed
+    return round(tiers_used * COST_PER_20PCT, 2), total_consumed, True
+
+
+def get_quota_cost_for_date(date_str):
+    cost, used_pct, _ = get_quota_usage_for_date(date_str)
+    return cost, used_pct
 
 
 def _get_codex_dedup_ratios():
@@ -163,25 +199,344 @@ def _get_codex_dedup_ratios():
     return ratios
 
 
-def get_codex_data():
+def _scale_usage_counts(container, ratio):
+    for key in TOKEN_FIELDS + COST_FIELDS:
+        if key in container:
+            container[key] = round(container[key] * ratio) if key in TOKEN_FIELDS else round(container[key] * ratio, 4)
+
+
+def _run_tu_report(source):
     try:
-        result = subprocess.run(["tu", "daily", "--json"], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(["tu", source, "--json"], capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            data = json.loads(result.stdout)
-            # Apply worktree dedup ratios to correct overcounting
-            ratios = _get_codex_dedup_ratios()
-            for day in data.get("daily", []):
-                r = ratios.get(day.get("date", ""), 1.0)
-                if r < 1.0:
-                    t = day.get("totals", {})
-                    for k in ["input_tokens", "cache_read_input_tokens", "output_tokens",
-                              "reasoning_output_tokens", "total_tokens", "cost_usd"]:
-                        if k in t:
-                            t[k] = round(t[k] * r) if "token" in k else round(t[k] * r, 4)
-            return data
+            return json.loads(result.stdout)
     except Exception:
         pass
     return {"daily": []}
+
+
+def _apply_codex_dedup_ratios(data):
+    ratios = _get_codex_dedup_ratios()
+    for day in data.get("daily", []):
+        r = ratios.get(day.get("date", ""), 1.0)
+        if r >= 1.0:
+            continue
+        _scale_usage_counts(day.get("totals", {}), r)
+        for model_totals in day.get("models", {}).values():
+            _scale_usage_counts(model_totals, r)
+        for source_totals in day.get("sources", {}).values():
+            _scale_usage_counts(source_totals, r)
+    if "totals" in data:
+        totals = defaultdict(float)
+        for day in data.get("daily", []):
+            for key in TOKEN_FIELDS + COST_FIELDS:
+                totals[key] += day.get("totals", {}).get(key, 0)
+        data["totals"] = {
+            key: round(value) if key in TOKEN_FIELDS else round(value, 4)
+            for key, value in totals.items()
+        }
+    return data
+
+
+def get_codex_data():
+    return _apply_codex_dedup_ratios(_run_tu_report("codex"))
+
+
+def get_claude_tu_data():
+    return _run_tu_report("claude")
+
+
+def _report_total_tokens(report):
+    return _sum_report_totals(report).get("total_tokens", 0)
+
+
+def _total_delta_pct(left, right):
+    return round(((left - right) / right * 100.0), 2) if right else 0.0
+
+
+def get_claude_local_data():
+    now = time.time()
+    if _CLAUDE_LOCAL_CACHE["value"] is not None and now - _CLAUDE_LOCAL_CACHE["at"] < 60:
+        return _CLAUDE_LOCAL_CACHE["value"]
+    files = _discover_claude_usage_files()
+    data = scan_claude_usage_files(files) if files else {"daily": [], "totals": {}, "stats": {"files_discovered": 0}}
+    data["source"] = "local_jsonl_dedup"
+    _CLAUDE_LOCAL_CACHE["at"] = now
+    _CLAUDE_LOCAL_CACHE["value"] = data
+    return data
+
+
+def get_claude_data(tu_data=None):
+    tu_data = tu_data or get_claude_tu_data()
+    local = get_claude_local_data()
+    local_total = _report_total_tokens(local)
+    tu_total = _report_total_tokens(tu_data)
+    delta_pct = abs(_total_delta_pct(local_total, tu_total))
+    if local_total and tu_total and delta_pct > CLAUDE_MISMATCH_THRESHOLD_PCT:
+        local["tu_total_tokens"] = tu_total
+        local["tu_delta_pct"] = _total_delta_pct(local_total, tu_total)
+        return local
+    tu_data["source"] = "tu_claude"
+    return tu_data
+
+
+def _extract_nested(obj, path):
+    cur = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _extract_usage_value(entry, keys):
+    for key in keys:
+        value = _extract_nested(entry, key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return 0
+
+
+def _extract_claude_usage(entry):
+    return {
+        "input_tokens": _extract_usage_value(entry, ["message.usage.input_tokens", "usage.input_tokens", "input_tokens"]),
+        "cache_creation_input_tokens": _extract_usage_value(entry, [
+            "message.usage.cache_creation_input_tokens",
+            "usage.cache_creation_input_tokens",
+            "cache_creation_input_tokens",
+        ]),
+        "cache_read_input_tokens": _extract_usage_value(entry, [
+            "message.usage.cache_read_input_tokens",
+            "usage.cache_read_input_tokens",
+            "usage.cached_input_tokens",
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+        ]),
+        "output_tokens": _extract_usage_value(entry, ["message.usage.output_tokens", "usage.output_tokens", "output_tokens"]),
+        "reasoning_output_tokens": _extract_usage_value(entry, [
+            "message.usage.reasoning_output_tokens",
+            "usage.reasoning_output_tokens",
+            "usage.output_tokens_details.reasoning_tokens",
+            "output_tokens_details.reasoning_tokens",
+        ]),
+        "cost_usd": float(_safe_number(entry.get("costUSD"), 0.0)),
+    }
+
+
+def _claude_model(entry):
+    for path in ["message.model", "usage.model", "model", "message.metadata.model"]:
+        value = _extract_nested(entry, path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unknown"
+
+
+def _claude_model_prices(model):
+    model = (model or "").lower()
+    if "opus" in model:
+        return 5.0, 25.0
+    if "sonnet" in model:
+        return 3.0, 15.0
+    if "haiku" in model:
+        return 1.0, 5.0
+    return 0.0, 0.0
+
+
+def _claude_cache_creation_tokens(entry, usage):
+    creation = _extract_nested(entry, "message.usage.cache_creation") or _extract_nested(entry, "usage.cache_creation")
+    total = usage.get("cache_creation_input_tokens", 0)
+    if not isinstance(creation, dict):
+        return total, 0, 0
+    five_min = int(_safe_number(creation.get("ephemeral_5m_input_tokens"), 0))
+    one_hour = int(_safe_number(creation.get("ephemeral_1h_input_tokens"), 0))
+    accounted = five_min + one_hour
+    unclassified = max(total - accounted, 0)
+    return unclassified, five_min, one_hour
+
+
+def _estimate_claude_cost(entry, model, usage):
+    recorded = _safe_number(entry.get("costUSD"), 0.0)
+    if recorded > 0:
+        return float(recorded)
+
+    input_price, output_price = _claude_model_prices(model)
+    if input_price <= 0 and output_price <= 0:
+        return 0.0
+
+    input_cost = usage.get("input_tokens", 0) * input_price
+    cache_write_cost = usage.get("cache_creation_input_tokens", 0) * input_price * 1.25
+    cache_read_cost = usage.get("cache_read_input_tokens", 0) * input_price * 0.1
+    output_cost = usage.get("output_tokens", 0) * output_price
+    return (input_cost + cache_write_cost + cache_read_cost + output_cost) / 1_000_000
+
+
+def _add_counts(target, usage):
+    for key in TOKEN_FIELDS + COST_FIELDS:
+        target[key] += usage.get(key, 0)
+
+
+def scan_claude_usage_files(files):
+    daily = defaultdict(lambda: {
+        "totals": defaultdict(float),
+        "models": defaultdict(lambda: defaultdict(float)),
+    })
+    stats = {
+        "files_discovered": len(files),
+        "lines_total": 0,
+        "lines_parsed": 0,
+        "deduped_entries": 0,
+        "lines_invalid_json": 0,
+        "lines_missing_usage": 0,
+    }
+    seen = set()
+
+    for file_path in files:
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    stats["lines_total"] += 1
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        stats["lines_invalid_json"] += 1
+                        continue
+                    if entry.get("type") not in (None, "assistant"):
+                        continue
+                    usage = _extract_claude_usage(entry)
+                    model = _claude_model(entry)
+                    usage["total_tokens"] = (
+                        usage["input_tokens"]
+                        + usage["cache_creation_input_tokens"]
+                        + usage["cache_read_input_tokens"]
+                        + usage["output_tokens"]
+                    )
+                    usage["cost_usd"] = _estimate_claude_cost(entry, model, usage)
+                    if usage["total_tokens"] == 0:
+                        stats["lines_missing_usage"] += 1
+                        continue
+
+                    message_id = _extract_nested(entry, "message.id") or entry.get("messageId")
+                    request_id = entry.get("requestId") or entry.get("request_id")
+                    if message_id and request_id:
+                        key = f"{message_id}:{request_id}"
+                        if key in seen:
+                            stats["deduped_entries"] += 1
+                            continue
+                        seen.add(key)
+
+                    timestamp = entry.get("timestamp", "")
+                    date = timestamp[:10] if len(timestamp) >= 10 else "unknown"
+                    _add_counts(daily[date]["totals"], usage)
+                    _add_counts(daily[date]["models"][model], usage)
+                    stats["lines_parsed"] += 1
+        except OSError:
+            continue
+
+    rows = []
+    totals = defaultdict(float)
+    for date in sorted(daily.keys()):
+        row = daily[date]
+        clean_totals = {
+            key: round(value) if key in TOKEN_FIELDS else round(value, 6)
+            for key, value in row["totals"].items()
+        }
+        clean_models = {
+            model: {
+                key: round(value) if key in TOKEN_FIELDS else round(value, 6)
+                for key, value in counts.items()
+            }
+            for model, counts in row["models"].items()
+        }
+        rows.append({"date": date, "totals": clean_totals, "models": clean_models})
+        for key, value in clean_totals.items():
+            totals[key] += value
+
+    return {
+        "daily": rows,
+        "totals": {
+            key: round(value) if key in TOKEN_FIELDS else round(value, 6)
+            for key, value in totals.items()
+        },
+        "stats": stats,
+    }
+
+
+def _discover_claude_usage_files():
+    files = []
+    for root in CLAUDE_PROJECT_DIRS:
+        if root.exists():
+            files.extend(root.rglob("*.jsonl"))
+    return files
+
+
+def _sum_report_totals(report):
+    totals = defaultdict(float)
+    for day in report.get("daily", []):
+        for key in TOKEN_FIELDS + COST_FIELDS:
+            totals[key] += day.get("totals", {}).get(key, 0)
+    if report.get("totals"):
+        for key in TOKEN_FIELDS + COST_FIELDS:
+            if key in report["totals"]:
+                totals[key] = report["totals"][key]
+    return {
+        key: round(value) if key in TOKEN_FIELDS else round(value, 6)
+        for key, value in totals.items()
+    }
+
+
+def get_claude_validation_summary(claude_data=None, tu_data=None):
+    now = time.time()
+    if _CLAUDE_VALIDATION_CACHE["value"] is not None and now - _CLAUDE_VALIDATION_CACHE["at"] < 300:
+        return _CLAUDE_VALIDATION_CACHE["value"]
+
+    local = get_claude_local_data()
+    if not local.get("daily"):
+        return None
+
+    tu_totals = _sum_report_totals(tu_data or get_claude_tu_data())
+    active_totals = _sum_report_totals(claude_data or local)
+    local_total = local.get("totals", {}).get("total_tokens", 0)
+    tu_total = tu_totals.get("total_tokens", 0)
+    delta = local_total - tu_total
+    delta_pct = _total_delta_pct(local_total, tu_total)
+    summary = {
+        "source": "local_jsonl_dedup_vs_tu_claude",
+        "active_source": (claude_data or local).get("source", "unknown"),
+        "active_total_tokens": active_totals.get("total_tokens", 0),
+        "local_total_tokens": local_total,
+        "local_cost": local.get("totals", {}).get("cost_usd", 0),
+        "tu_total_tokens": tu_total,
+        "tu_cost": tu_totals.get("cost_usd", 0),
+        "delta_tokens": delta,
+        "delta_pct": delta_pct,
+        "mismatch_threshold_pct": CLAUDE_MISMATCH_THRESHOLD_PCT,
+        "stats": local.get("stats", {}),
+    }
+    _CLAUDE_VALIDATION_CACHE["at"] = now
+    _CLAUDE_VALIDATION_CACHE["value"] = summary
+    return summary
+
+
+def _provider_entry(day):
+    totals = day.get("totals", {})
+    models = day.get("models", {})
+    return {
+        "input_tokens": totals.get("input_tokens", 0),
+        "cache_creation_tokens": totals.get("cache_creation_input_tokens", 0),
+        "cached_tokens": totals.get("cache_read_input_tokens", 0),
+        "output_tokens": totals.get("output_tokens", 0),
+        "reasoning_tokens": totals.get("reasoning_output_tokens", 0),
+        "total_tokens": totals.get("total_tokens", 0),
+        "cost": round(totals.get("cost_usd", 0), 2),
+        "models": sorted(
+            models.keys(),
+            key=lambda model: models[model].get("total_tokens", 0),
+            reverse=True,
+        ),
+    }
 
 
 def get_anti_data():
@@ -194,7 +549,6 @@ def get_anti_data():
                         entries.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
-    from collections import defaultdict
     daily = defaultdict(lambda: {"input_tokens": 0, "output_tokens": 0, "bytes_in": 0, "bytes_out": 0, "cost": 0})
     for e in entries:
         date = e.get("timestamp", "")[:10]
@@ -204,18 +558,28 @@ def get_anti_data():
         d["bytes_in"] += e.get("delta_bytes_in", 0)
         d["bytes_out"] += e.get("delta_bytes_out", 0)
         d["cost"] += e.get("total_cost_est", 0)
-    # Prefer quota-based cost over nettop estimate
-    # Quota is deterministic (actual usage); nettop is noisy (API ratio varies 3x)
+
     for date, d in daily.items():
-        quota_cost, used_pct = get_quota_cost_for_date(date)
-        d["raw_cost"] = d["cost"]  # nettop estimate (for reference)
+        quota_cost, used_pct, has_quota = get_quota_usage_for_date(date)
+        raw_cost = d["cost"]
+        raw_input = d["input_tokens"]
+        raw_output = d["output_tokens"]
+        d["raw_cost"] = raw_cost
+        d["raw_input_tokens"] = raw_input
+        d["raw_output_tokens"] = raw_output
         d["quota_used_pct"] = used_pct
-        if quota_cost > 0:
-            d["cost"] = quota_cost  # quota-based = accurate
+        d["capped"] = False
+        if has_quota and used_pct <= 0:
+            d["cost"] = 0.0
+            d["input_tokens"] = 0
+            d["output_tokens"] = 0
+            d["cost_source"] = "quota_zero"
+            d["suppressed_raw_estimate"] = raw_input > 0 or raw_output > 0 or raw_cost > 0
+        elif has_quota and quota_cost > 0:
+            d["cost"] = quota_cost
             d["cost_source"] = "quota"
         else:
             d["cost_source"] = "nettop"
-        d["capped"] = False
     return dict(daily)
 
 
@@ -231,67 +595,59 @@ def get_anti_status():
     return {"running": False, "pid": None}
 
 
-def get_anti_quota():
-    """Fetch live quota from tu antigravity --json"""
-    try:
-        result = subprocess.run(["tu", "antigravity", "--json"], capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            return {
-                "plan": data.get("plan_type", "Unknown"),
-                "email": data.get("account_email", ""),
-                "models": [{
-                    "label": m["label"],
-                    "remaining": round(m["remaining_fraction"] * 100, 1),
-                    "reset_time": m.get("reset_time", 0),
-                } for m in data.get("models", [])],
-                "primary_used": data.get("primary_used_percent", 0),
-            }
-    except Exception:
-        pass
-    return None
-
-
 def build_api_response():
     codex = get_codex_data()
+    claude_tu = get_claude_tu_data()
+    claude = get_claude_data(claude_tu)
     anti = get_anti_data()
     anti_status = get_anti_status()
     all_dates = set()
     codex_by_date = {}
+    claude_by_date = {}
     for day in codex.get("daily", []):
         date = day.get("date", "")
-        codex_by_date[date] = day
-        all_dates.add(date)
+        if date:
+            codex_by_date[date] = day
+            all_dates.add(date)
+    for day in claude.get("daily", []):
+        date = day.get("date", "")
+        if date:
+            claude_by_date[date] = day
+            all_dates.add(date)
     all_dates.update(anti.keys())
     combined = []
     for date in sorted(all_dates):
-        entry = {"date": date, "codex": None, "antigravity": None}
+        entry = {"date": date, "codex": None, "claude": None, "antigravity": None}
         if date in codex_by_date:
-            cd = codex_by_date[date]
-            t = cd.get("totals", {})
-            cc, ct = t.get("cost_usd", 0), t.get("total_tokens", 0)
-            entry["codex"] = {
-                "input_tokens": t.get("input_tokens", 0), "cached_tokens": t.get("cache_read_input_tokens", 0),
-                "output_tokens": t.get("output_tokens", 0), "reasoning_tokens": t.get("reasoning_output_tokens", 0),
-                "total_tokens": ct, "cost": round(cc, 2),
-                "models": sorted(cd.get("models", {}).keys(),
-                                 key=lambda m: cd["models"][m].get("total_tokens", 0), reverse=True),
-            }
+            entry["codex"] = _provider_entry(codex_by_date[date])
+        if date in claude_by_date:
+            entry["claude"] = _provider_entry(claude_by_date[date])
         if date in anti:
             ad = anti[date]
-            ac, at = ad["cost"], ad["input_tokens"] + ad["output_tokens"]
+            ac = ad["cost"]
+            at = ad["input_tokens"] + ad["output_tokens"]
             entry["antigravity"] = {
-                "input_tokens": ad["input_tokens"], "output_tokens": ad["output_tokens"],
-                "total_tokens": at, "cost": round(ac, 2), "bytes_in": ad["bytes_in"], "bytes_out": ad["bytes_out"],
-                "model": ANTI_MODEL["name"], "estimated": True,
-                "capped": ad.get("capped", False), "raw_cost": round(ad.get("raw_cost", ac), 2),
+                "input_tokens": ad["input_tokens"],
+                "output_tokens": ad["output_tokens"],
+                "total_tokens": at,
+                "cost": round(ac, 2),
+                "bytes_in": ad["bytes_in"],
+                "bytes_out": ad["bytes_out"],
+                "model": ANTI_MODEL["name"],
+                "estimated": True,
+                "capped": ad.get("capped", False),
+                "raw_cost": round(ad.get("raw_cost", ac), 2),
+                "raw_input_tokens": ad.get("raw_input_tokens", ad["input_tokens"]),
+                "raw_output_tokens": ad.get("raw_output_tokens", ad["output_tokens"]),
                 "quota_used_pct": ad.get("quota_used_pct", 0),
+                "cost_source": ad.get("cost_source", "nettop"),
+                "suppressed_raw_estimate": ad.get("suppressed_raw_estimate", False),
             }
         combined.append(entry)
     return {
         "daily": combined,
         "anti_estimator": anti_status,
-        "anti_quota": get_anti_quota(),
+        "claude_validation": get_claude_validation_summary(claude, claude_tu),
         "model": ANTI_MODEL["name"],
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -385,8 +741,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .br{width:100%;max-width:40px;border-radius:6px 6px 2px 2px;min-height:2px;transition:all 0.3s}
 .br:hover{filter:brightness(1.3);transform:scaleX(1.1)}
 .br.cx{background:linear-gradient(180deg,var(--green),rgba(52,211,153,0.4))}
+.br.cl{background:linear-gradient(180deg,var(--cyan),rgba(34,211,238,0.4))}
 .br.ax{background:linear-gradient(180deg,var(--orange),rgba(251,146,60,0.4))}
 [data-theme="light"] .br.cx{background:linear-gradient(180deg,var(--green),rgba(5,150,105,0.3))}
+[data-theme="light"] .br.cl{background:linear-gradient(180deg,var(--cyan),rgba(8,145,178,0.3))}
 [data-theme="light"] .br.ax{background:linear-gradient(180deg,var(--orange),rgba(234,88,12,0.3))}
 .bd2{position:absolute;bottom:-22px;font-size:10px;color:var(--t3);font-family:'JetBrains Mono',monospace;white-space:nowrap}
 .tp{display:none;position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);padding:10px 14px;border-radius:12px;font-size:12px;white-space:nowrap;z-index:20;font-family:'JetBrains Mono',monospace;line-height:1.6}
@@ -397,14 +755,11 @@ td{padding:14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,0.03);fo
 [data-theme="light"] td{border-bottom-color:rgba(0,0,0,0.04)}
 tr:hover td{background:rgba(108,99,255,0.03)}
 .tg{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;letter-spacing:0.3px}
-.tg.cx{background:var(--gbg);color:var(--green)}.tg.ax{background:var(--obg);color:var(--orange)}
+.tg.cx{background:var(--gbg);color:var(--green)}.tg.cl{background:rgba(34,211,238,0.1);color:var(--cyan)}.tg.ax{background:var(--obg);color:var(--orange)}
 .tg.es{background:rgba(167,139,250,0.1);color:var(--a2);font-style:italic;font-weight:400}
 .tr td{font-weight:700;border-top:2px solid var(--gb)}
 .tr td:last-child{background:linear-gradient(135deg,var(--accent),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:15px}
 .ft{text-align:center;padding:20px;font-size:11px;color:var(--t3)}
-.qt{margin-bottom:20px}
-.qt h2{font-size:16px;margin-bottom:14px;font-weight:700}
-.qt h2 span{font-size:12px;font-weight:500;color:var(--t3);margin-left:8px}
 .qm{display:flex;flex-direction:column;gap:8px}
 .qr{display:flex;align-items:center;gap:10px;font-size:12px;font-family:'JetBrains Mono',monospace}
 .qr .ql{width:160px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
@@ -422,6 +777,7 @@ tr:hover td{background:rgba(108,99,255,0.03)}
     <div class="logo"><div class="li">⚡</div><div><h1>Star Tokens</h1><div class="sub">UNIFIED AI USAGE DASHBOARD</div></div></div>
     <div class="hr">
       <div id="st"></div>
+      <button class="rb" onclick="startEstimator()">Start Anti</button>
       <button class="rb" onclick="refresh()">↻ Refresh</button>
       <div class="tt" onclick="toggleTheme()"><span class="i m">🌙</span><span class="i s">☀️</span></div>
     </div>
@@ -436,16 +792,16 @@ tr:hover td{background:rgba(108,99,255,0.03)}
     <div class="range-label" id="rl"></div>
   </div>
   <div class="cds" id="cds"></div>
-  <div class="gl sc qt" id="quota"></div>
+  <div class="gl sc" id="validation"></div>
   <div class="gl sc">
-    <h2>Daily Cost<div class="lg"><div class="lgi"><div class="lgd" style="background:var(--green)"></div>Codex</div><div class="lgi"><div class="lgd" style="background:var(--orange)"></div>Antigravity</div></div></h2>
+    <h2>Daily Cost<div class="lg"><div class="lgi"><div class="lgd" style="background:var(--green)"></div>Codex</div><div class="lgi"><div class="lgd" style="background:var(--cyan)"></div>Claude Code</div><div class="lgi"><div class="lgd" style="background:var(--orange)"></div>Antigravity</div></div></h2>
     <div class="ch" id="ch"></div>
   </div>
   <div class="gl sc">
     <h2>Detailed Usage</h2>
     <table><thead><tr><th>Date</th><th>Provider</th><th style="text-align:right">Input</th><th style="text-align:right">Cached</th><th style="text-align:right">Output</th><th style="text-align:right">Cost</th></tr></thead><tbody id="tb"></tbody></table>
   </div>
-  <div class="ft">Star Tokens · Codex via <b>tu</b> (precise) · Antigravity via nettop (est.) · <span id="ts"></span></div>
+  <div class="ft">Star Tokens · Codex via <b>tu codex</b> · Claude Code via local JSONL/tu validation · Antigravity via local snapshots/nettop · <span id="ts"></span></div>
 </div>
 <script>
 const F=n=>n.toLocaleString(),C=n=>'$'+n.toFixed(2);
@@ -459,6 +815,11 @@ function setRange(r){
   localStorage.setItem('st-range',r);
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.range===r));
   if(_allData)render(_allData);
+}
+
+async function startEstimator(){
+  await fetch('http://localhost:"""+str(PORT)+r"""/api/start-estimator',{method:'POST'});
+  await refresh();
 }
 
 function getDateRange(){
@@ -496,62 +857,59 @@ function render(d){
   const daily=allDaily.filter(x=>x.date>=dr.start&&x.date<=dr.end);
 
   // Compute totals for filtered range
-  let T={codex_cost:0,codex_in:0,codex_cached:0,codex_out:0,anti_cost:0,anti_in:0,anti_out:0,total_cost:0};
+  let T={
+    codex_cost:0,codex_in:0,codex_cache_create:0,codex_cached:0,codex_out:0,
+    claude_cost:0,claude_in:0,claude_cache_create:0,claude_cached:0,claude_out:0,
+    anti_cost:0,anti_in:0,anti_out:0,total_cost:0
+  };
   daily.forEach(x=>{
-    if(x.codex){T.codex_cost+=x.codex.cost;T.codex_in+=x.codex.input_tokens;T.codex_cached+=x.codex.cached_tokens;T.codex_out+=x.codex.output_tokens+x.codex.reasoning_tokens}
+    if(x.codex){T.codex_cost+=x.codex.cost;T.codex_in+=x.codex.input_tokens;T.codex_cache_create+=x.codex.cache_creation_tokens||0;T.codex_cached+=x.codex.cached_tokens;T.codex_out+=x.codex.output_tokens+x.codex.reasoning_tokens}
+    if(x.claude){T.claude_cost+=x.claude.cost;T.claude_in+=x.claude.input_tokens;T.claude_cache_create+=x.claude.cache_creation_tokens||0;T.claude_cached+=x.claude.cached_tokens;T.claude_out+=x.claude.output_tokens+x.claude.reasoning_tokens}
     if(x.antigravity){T.anti_cost+=x.antigravity.cost;T.anti_in+=x.antigravity.input_tokens;T.anti_out+=x.antigravity.output_tokens}
   });
-  T.total_cost=T.codex_cost+T.anti_cost;
-  const totalIn=T.codex_in+T.anti_in,totalOut=T.codex_out+T.anti_out;
+  T.total_cost=T.codex_cost+T.claude_cost+T.anti_cost;
+  const totalIn=T.codex_in+T.claude_in+T.anti_in,totalOut=T.codex_out+T.claude_out+T.anti_out,totalCached=T.codex_cache_create+T.codex_cached+T.claude_cache_create+T.claude_cached;
 
   document.getElementById('st').innerHTML=ae.running?'<span class="bd on"><span class="dt"></span>Estimator</span>':'<span class="bd off"><span class="dt"></span>Estimator off</span>';
   document.getElementById('ts').textContent=ga;
   document.getElementById('rl').innerHTML=`<span>${dr.label}</span> · ${daily.length} day${daily.length!==1?'s':''}`;
 
   const fmtTok=n=>n>=1e9?`${(n/1e9).toFixed(2)}B`:n>=1e6?`${(n/1e6).toFixed(1)}M`:F(n);
-  const gptTok=T.codex_in+T.codex_cached+T.codex_out,claudeTok=T.anti_in+T.anti_out,totalTok=gptTok+claudeTok;
+  const codexTok=T.codex_in+T.codex_cache_create+T.codex_cached+T.codex_out;
+  const claudeTok=T.claude_in+T.claude_cache_create+T.claude_cached+T.claude_out;
+  const antiTok=T.anti_in+T.anti_out,totalTok=codexTok+claudeTok+antiTok;
   document.getElementById('cds').innerHTML=`
     <div class="gl cd t"><div class="gw"></div><div class="lb">Total Cost</div><div class="vl">${C(T.total_cost)}</div><div class="sb">${daily.length} day${daily.length!==1?'s':''}</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">ChatGPT</div><div class="vl">${C(T.codex_cost)}</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Claude Opus</div><div class="vl">${C(T.anti_cost)}</div></div>
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex</div><div class="vl">${C(T.codex_cost)}</div></div>
+    <div class="gl cd k"><div class="gw"></div><div class="lb">Claude Code</div><div class="vl">${C(T.claude_cost)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Antigravity</div><div class="vl">${C(T.anti_cost)}</div></div>
     <div class="gl cd" style="--accent:#6366f1"><div class="gw" style="background:#6366f1"></div><div class="lb">Total Tokens</div><div class="vl" style="color:#818cf8">${fmtTok(totalTok)}</div></div>
-    <div class="gl cd c"><div class="gw"></div><div class="lb">GPT Tokens</div><div class="vl">${fmtTok(gptTok)}</div></div>
-    <div class="gl cd a"><div class="gw"></div><div class="lb">Claude Tokens</div><div class="vl">${fmtTok(claudeTok)}</div></div>`;
+    <div class="gl cd c"><div class="gw"></div><div class="lb">Codex Tokens</div><div class="vl">${fmtTok(codexTok)}</div></div>
+    <div class="gl cd k"><div class="gw"></div><div class="lb">Claude Tokens</div><div class="vl">${fmtTok(claudeTok)}</div></div>
+    <div class="gl cd a"><div class="gw"></div><div class="lb">Anti Tokens</div><div class="vl">${fmtTok(antiTok)}</div></div>`;
 
-  const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.antigravity?.cost||0)),1);
+  const mx=Math.max(...daily.map(d=>(d.codex?.cost||0)+(d.claude?.cost||0)+(d.antigravity?.cost||0)),1);
   document.getElementById('ch').innerHTML=daily.map(d=>{
-    const cc=d.codex?.cost||0,ac=d.antigravity?.cost||0,ch=Math.max(2,cc/mx*190),ah=Math.max(ac>0?2:0,ac/mx*190);
-    return`<div class="bg"><div class="gl tp"><div style="font-weight:600;margin-bottom:4px">${d.date}</div><div style="color:var(--green)">Codex: ${C(cc)}</div><div style="color:var(--orange)">Anti: ${C(ac)}</div><div style="margin-top:4px;font-weight:600">Total: ${C(cc+ac)}</div></div>${ac>0?`<div class="br ax" style="height:${ah}px"></div>`:''}${cc>0?`<div class="br cx" style="height:${ch}px"></div>`:''}<span class="bd2">${d.date.slice(5)}</span></div>`}).join('');
+    const cc=d.codex?.cost||0,lc=d.claude?.cost||0,ac=d.antigravity?.cost||0;
+    const ch=Math.max(cc>0?2:0,cc/mx*190),lh=Math.max(lc>0?2:0,lc/mx*190),ah=Math.max(ac>0?2:0,ac/mx*190);
+    return`<div class="bg"><div class="gl tp"><div style="font-weight:600;margin-bottom:4px">${d.date}</div><div style="color:var(--green)">Codex: ${C(cc)}</div><div style="color:var(--cyan)">Claude: ${C(lc)}</div><div style="color:var(--orange)">Anti: ${C(ac)}</div><div style="margin-top:4px;font-weight:600">Total: ${C(cc+lc+ac)}</div></div>${ac>0?`<div class="br ax" style="height:${ah}px"></div>`:''}${lc>0?`<div class="br cl" style="height:${lh}px"></div>`:''}${cc>0?`<div class="br cx" style="height:${ch}px"></div>`:''}<span class="bd2">${d.date.slice(5)}</span></div>`}).join('');
 
   let r='';
   daily.slice().reverse().forEach(d=>{
-    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens)}</td><td style="text-align:right;color:var(--t3)">${F(c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`}
-    if(d.antigravity){const a=d.antigravity;r+=`<tr><td>${d.codex?'':d.date}</td><td><span class="tg ax">Anti</span> <span class="tg es">est.</span></td><td style="text-align:right">~${F(a.input_tokens)}</td><td style="text-align:right;color:var(--t3)">—</td><td style="text-align:right">~${F(a.output_tokens)}</td><td style="text-align:right">~${C(a.cost)}</td></tr>`}
+    let shown=false;
+    if(d.codex){const c=d.codex;r+=`<tr><td>${d.date}</td><td><span class="tg cx">Codex</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens)}</td><td style="text-align:right;color:var(--t3)">${F((c.cache_creation_tokens||0)+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`;shown=true}
+    if(d.claude){const c=d.claude;r+=`<tr><td>${shown?'':d.date}</td><td><span class="tg cl">Claude Code</span> ${c.models.join(', ')}</td><td style="text-align:right">${F(c.input_tokens)}</td><td style="text-align:right;color:var(--t3)">${F((c.cache_creation_tokens||0)+c.cached_tokens)}</td><td style="text-align:right">${F(c.output_tokens+c.reasoning_tokens)}</td><td style="text-align:right">${C(c.cost)}</td></tr>`;shown=true}
+    if(d.antigravity){const a=d.antigravity;const sourceLabel=a.cost_source==='quota_zero'?'idle':a.cost_source==='quota'?'adjusted':(a.cost_source||'est.');const raw=a.suppressed_raw_estimate?` <span class="tg es">raw ${C(a.raw_cost)}</span>`:'';r+=`<tr><td>${shown?'':d.date}</td><td><span class="tg ax">Anti</span> <span class="tg es">${sourceLabel}</span>${raw}</td><td style="text-align:right">${a.estimated?'~':''}${F(a.input_tokens)}</td><td style="text-align:right;color:var(--t3)">-</td><td style="text-align:right">${a.estimated?'~':''}${F(a.output_tokens)}</td><td style="text-align:right">${a.estimated?'~':''}${C(a.cost)}</td></tr>`}
   });
-  r+=`<tr class="tr"><td>TOTAL</td><td></td><td style="text-align:right">${F(totalIn)}</td><td style="text-align:right;color:var(--t3)">${F(T.codex_cached)}</td><td style="text-align:right">${F(totalOut)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
+  r+=`<tr class="tr"><td>TOTAL</td><td></td><td style="text-align:right">${F(totalIn)}</td><td style="text-align:right;color:var(--t3)">${F(totalCached)}</td><td style="text-align:right">${F(totalOut)}</td><td style="text-align:right">${C(T.total_cost)}</td></tr>`;
   document.getElementById('tb').innerHTML=r;
 
-  // Quota section
-  const q=data.anti_quota;
-  if(q){
-    const colors=['#6366f1','#22c55e','#f59e0b','#ec4899','#06b6d4','#8b5cf6'];
-    const now=Date.now()/1000;
-    let qh=`<h2>Antigravity Quota<span>${q.plan} · ${q.email}</span></h2><div class="qm">`;
-    q.models.forEach((m,i)=>{
-      const rem=m.remaining;
-      const used=(100-rem).toFixed(1);
-      const c=colors[i%colors.length];
-      const bg=rem>60?'#22c55e':rem>30?'#f59e0b':'#ef4444';
-      const dt=m.reset_time-now;
-      const rh=Math.floor(dt/3600),rm=Math.floor((dt%3600)/60);
-      const rt=dt>0?`${rh}h${rm}m`:'now';
-      qh+=`<div class="qr"><div class="ql">${m.label}</div><div class="qb"><div class="qf" style="width:${rem}%;background:${bg}"></div></div><div class="qp" style="color:${bg}">${rem}%</div><div class="qrt">↻ ${rt}</div></div>`;
-    });
-    qh+='</div>';
-    document.getElementById('quota').innerHTML=qh;
-    document.getElementById('quota').style.display='';
+  const v=d.claude_validation;
+  if(v){
+    document.getElementById('validation').innerHTML=`<h2>Claude Validation<span style="font-size:12px;font-weight:500;color:var(--t3)">active: ${v.active_source}</span></h2><div class="qm"><div class="qr"><div class="ql">Local parsed</div><div style="flex:1">${F(v.local_total_tokens)} tokens · ${C(v.local_cost||0)}</div></div><div class="qr"><div class="ql">tu claude</div><div style="flex:1">${F(v.tu_total_tokens)} tokens · ${C(v.tu_cost||0)}</div></div><div class="qr"><div class="ql">Delta</div><div style="flex:1;color:${Math.abs(v.delta_pct)<=v.mismatch_threshold_pct?'var(--green)':'var(--orange)'}">${F(v.delta_tokens)} (${v.delta_pct}%)</div></div><div class="qr"><div class="ql">Deduped</div><div style="flex:1">${F(v.stats?.deduped_entries||0)} entries</div></div></div>`;
+    document.getElementById('validation').style.display='';
   } else {
-    document.getElementById('quota').style.display='none';
+    document.getElementById('validation').style.display='none';
   }
 }
 refresh();setInterval(refresh,30000);
@@ -575,23 +933,36 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(DASHBOARD_HTML.encode())
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/start-estimator":
+            ensure_estimator()
+            data = {"anti_estimator": get_anti_status()}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+        else:
+            self.send_error(404)
+
     def log_message(self, *a): pass
 
 
 def ensure_estimator():
-    """Force-start the estimator daemon. GUI MUST always launch with estimator."""
+    """Start the estimator daemon after an explicit user action."""
     import time
     status = get_anti_status()
     if status["running"]:
         print(f"  📡 Antigravity estimator already running (PID {status['pid']})")
-        return
+        return status
     # Kill stale PID file
     pid_file = Path.home() / ".config" / "anti-tracker" / "estimator.pid"
     if pid_file.exists():
         pid_file.unlink(missing_ok=True)
     if not ESTIMATOR_SCRIPT.exists():
         print("  ⚠️  anti_estimator.py not found!")
-        return
+        return get_anti_status()
     # Start and verify (retry once)
     for attempt in range(2):
         subprocess.Popen([sys.executable, str(ESTIMATOR_SCRIPT), "start"],
@@ -600,8 +971,9 @@ def ensure_estimator():
         status = get_anti_status()
         if status["running"]:
             print(f"  📡 Started Antigravity estimator daemon (PID {status['pid']})")
-            return
+            return status
     print("  ❌ Failed to start estimator daemon after 2 attempts!")
+    return get_anti_status()
 
 
 def start_api_server():
@@ -609,37 +981,59 @@ def start_api_server():
     server.serve_forever()
 
 
-def main():
-    print("⚡ Star Tokens Dashboard (Native GUI)")
-    ensure_estimator()
-
-    # Start API server in background thread
-    api_thread = threading.Thread(target=start_api_server, daemon=True)
-    api_thread.start()
-    print(f"  📊 API server on localhost:{PORT}")
-
-    # Launch native window via pywebview
+def launch_native_window(url):
     try:
         import webview
-        window = webview.create_window(
+    except ImportError:
+        print("  pywebview is not installed, so the native window cannot open.")
+        print("  Install it with: python3 -m pip install -r requirements.txt")
+        print("  Browser fallback is explicit only: python3 star_tokens.py --browser")
+        return False
+
+    try:
+        webview.create_window(
             "Star Tokens",
-            f"http://127.0.0.1:{PORT}",
+            url,
             width=1200,
             height=800,
             min_size=(800, 600),
             background_color="#050510",
             text_select=False,
         )
-        print("  🪟 Opening native window...")
+        print("  Opening native window...")
         webview.start(debug=False)
-    except ImportError:
-        print("  ⚠️  pywebview not found, falling back to browser")
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
+        return True
+    except Exception as exc:
+        print(f"  Native window failed: {exc}")
+        print("  Browser fallback is explicit only: python3 star_tokens.py --browser")
+        return False
+
+
+def launch_browser(url):
+    webbrowser.open(url)
+    return True
+
+
+def main():
+    print("⚡ Star Tokens Dashboard (Native GUI)")
+
+    # Start API server in background thread
+    api_thread = threading.Thread(target=start_api_server, daemon=True)
+    api_thread.start()
+    print(f"  📊 API server on localhost:{PORT}")
+    print("  Antigravity estimator is not auto-started; use anti_estimator.py start when needed.")
+
+    url = f"http://127.0.0.1:{PORT}"
+    if "--browser" in sys.argv:
+        launch_browser(url)
         try:
             api_thread.join()
         except KeyboardInterrupt:
             pass
+        return 0
+
+    return 0 if launch_native_window(url) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

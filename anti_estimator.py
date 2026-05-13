@@ -108,6 +108,51 @@ def _load_quota_price():
             pass
     return DEFAULT_COST_PER_20PCT
 
+
+def quota_remaining_fraction(model):
+    """Return a 0..1 remaining quota fraction from either modern or legacy shape."""
+    if not isinstance(model, dict):
+        return 1.0
+    remaining = model.get("remaining_fraction")
+    if isinstance(remaining, (int, float)):
+        return max(0.0, min(float(remaining), 1.0))
+    remaining_pct = model.get("remaining")
+    if isinstance(remaining_pct, (int, float)):
+        return max(0.0, min(float(remaining_pct) / 100.0, 1.0))
+    return 1.0
+
+
+def used_pct_from_quota_model(model):
+    """Return used percentage for a selected Antigravity quota model."""
+    return round((1.0 - quota_remaining_fraction(model)) * 100.0, 1)
+
+
+def ranked_quota_models(models):
+    """Rank Antigravity models using the same primary model intent as tokenusage."""
+    models = [m for m in models if isinstance(m, dict)]
+    ordered = []
+
+    def add_first(predicate):
+        for model in models:
+            if predicate(model) and not any(existing.get("label") == model.get("label") for existing in ordered):
+                ordered.append(model)
+                return
+
+    add_first(lambda m: "claude" in m.get("label", "").lower() and "thinking" not in m.get("label", "").lower())
+    add_first(lambda m: "gemini" in m.get("label", "").lower() and "pro" in m.get("label", "").lower() and "low" in m.get("label", "").lower())
+    add_first(lambda m: "gemini" in m.get("label", "").lower() and "flash" in m.get("label", "").lower())
+
+    if ordered:
+        return ordered
+
+    return sorted(models, key=quota_remaining_fraction)
+
+
+def select_primary_quota_model(models):
+    ranked = ranked_quota_models(models)
+    return ranked[0] if ranked else None
+
+
 def poll_quota():
     """Poll tu antigravity --json and log quota snapshot if changed."""
     import re
@@ -170,24 +215,34 @@ def poll_quota():
         models_raw = cascade.get("clientModelConfigs", [])
 
         models = []
-        max_used_pct = 0.0
         for m in models_raw:
             qi = m.get("quotaInfo", {})
             remaining = qi.get("remainingFraction", 1.0)
-            used_pct = round((1.0 - remaining) * 100, 1)
-            if used_pct > max_used_pct:
-                max_used_pct = used_pct
             models.append({
                 "label": m.get("label", "Unknown"),
+                "model_id": m.get("modelOrAlias", {}).get("model", ""),
                 "remaining": round(remaining * 100, 1),
                 "remaining_fraction": remaining,
                 "reset_time": qi.get("resetTime", ""),
             })
 
+        ranked = ranked_quota_models(models)
+        primary = ranked[0] if ranked else None
+        secondary = ranked[1] if len(ranked) > 1 else None
+        tertiary = ranked[2] if len(ranked) > 2 else None
+
         snapshot = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "plan": plan_info.get("planName", user_status.get("userTier", {}).get("name", "Unknown")),
-            "primary_used_pct": max_used_pct,
+            "primary_label": primary.get("label") if primary else None,
+            "primary_used_pct": used_pct_from_quota_model(primary) if primary else 0.0,
+            "primary_reset_time": primary.get("reset_time") if primary else "",
+            "secondary_label": secondary.get("label") if secondary else None,
+            "secondary_used_pct": used_pct_from_quota_model(secondary) if secondary else None,
+            "secondary_reset_time": secondary.get("reset_time") if secondary else "",
+            "tertiary_label": tertiary.get("label") if tertiary else None,
+            "tertiary_used_pct": used_pct_from_quota_model(tertiary) if tertiary else None,
+            "tertiary_reset_time": tertiary.get("reset_time") if tertiary else "",
             "prompt_credits": plan_status.get("availablePromptCredits", 0),
             "flow_credits": plan_status.get("availableFlowCredits", 0),
             "models": models,
@@ -196,7 +251,11 @@ def poll_quota():
         ensure_dir()
         with open(QUOTA_LOG, "a") as f:
             f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
-        print(f"  📊 Quota: {max_used_pct:.0f}% used | {len(models)} models | credits: {snapshot['prompt_credits']}P/{snapshot['flow_credits']}F")
+        print(
+            f"  📊 Quota: {snapshot['primary_used_pct']:.0f}% used"
+            f" ({snapshot.get('primary_label') or 'unknown'}) | {len(models)} models | "
+            f"credits: {snapshot['prompt_credits']}P/{snapshot['flow_credits']}F"
+        )
         return snapshot
     except Exception as e:
         print(f"  ⚠ Quota poll failed: {e}")

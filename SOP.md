@@ -6,10 +6,22 @@
 
 ---
 
+## 覆盖范围
+
+Star Tokens 必须同时覆盖三类本地 usage：
+
+- **Codex**
+- **Claude Code**
+- **Antigravity**
+
+任何 dashboard、README、GitHub About 文案都要明确说明这三个来源，不能再写成 Antigravity-only。
+
+---
+
 ## Codex 价格计算
 
 ### 数据来源
-- `tu daily --json` — 读取 `~/.codex/sessions/` 和 `~/.codex/archived_sessions/` 下的本地 JSONL session 文件
+- `tu codex --json` — 读取 `~/.codex/sessions/` 和 `~/.codex/archived_sessions/` 下的本地 JSONL session 文件
 - Token 数量由 OpenAI API response 中的 `last_token_usage` 返回
 - 交叉验证工具：`@ccusage/codex`（npm，用 LiteLLM 实时定价）
 
@@ -68,19 +80,68 @@
 
 ---
 
+## Claude Code 价格计算
+
+### 数据来源
+- `tu claude --json` — tokenusage 的 Claude Code 报告
+- `~/.claude/projects/**/*.jsonl`
+- `~/.config/claude/projects/**/*.jsonl`
+- 交叉验证工具：`npx ccusage@latest daily --json`
+
+### 本地 parser 规则
+- 只统计 assistant usage entry
+- 统计字段：
+  - `input_tokens`
+  - `cache_creation_input_tokens`
+  - `cache_read_input_tokens`
+  - `output_tokens`
+  - `reasoning_output_tokens`
+- 用 `message.id + requestId` 去重
+- `total_tokens = input + cache_creation + cache_read + output`
+
+### 数据源选择
+- 默认读取 `tu claude --json` 做对照
+- 同时运行本地 JSONL parser
+- 当本地 parser 与 `tu claude` 的 all-time token 差异超过 2% 时，dashboard 使用本地 dedup parser，并在 Claude Validation 区展示差异
+- `ccusage` 仅作为外部诊断，不作为强依赖
+
+### 定价
+- 使用 Claude/Anthropic 零售 API 价格口径
+- cache creation 按工具基线口径计价：`cache_creation_input_tokens * input_price * 1.25`
+- cache read 按 `cache_read_input_tokens * input_price * 0.1`
+- 不使用 Claude Pro/Max 订阅价格反推
+
+### 禁止事项
+- ❌ 不得把 Claude Code usage 算进 Codex
+- ❌ 不得直接 sum 重复的 assistant usage entry
+- ❌ 不得在 dashboard 隐藏本地 parser 与 `tu claude` 的显著差异
+
+---
+
 ## Antigravity 价格计算
 
 ### 数据来源
 - nettop 网络流量监控 → 估算 token 数量
-- `tu antigravity --json` → 实时 quota 配额数据
+- `quota_snapshots.jsonl` → 用于判断当天 primary model 是否 idle
+- `tu antigravity --json` → 仅用于 estimator 采集 snapshot，不在 dashboard 单独展示 quota 区
 
 ### 定价
 - 按当前模型的零售 API 价格（如 Claude Opus 4.6: input $5/M, output $25/M）
 
-### Quota 配额
-- 每 20% 配额档位 = **$50**（可配置 `quota_price.json`）
-- 100% = $250
-- 用作显示参考，**不作为 cost cap**
+### Idle / snapshot 逻辑
+- 不删除历史 Anti 日志
+- 如果当天有 snapshot 且 primary model used% 为 0，则 dashboard suppress nettop raw estimate，显示 Anti idle / $0
+- primary model 选择优先级：
+  1. 非-thinking Claude
+  2. Gemini Pro Low
+  3. Gemini Flash
+  4. fallback：remaining 最低
+- 避免旧 Claude Thinking 40% 污染今天 Gemini 0%
+
+### 禁止事项
+- ❌ 不得默认自动启动 `anti_estimator.py`
+- ❌ 不得在 dashboard 单独展示 quota 面板
+- ❌ 不得用订阅 quota 价值替代零售 API 价格
 
 ---
 
@@ -88,8 +149,9 @@
 
 | 工具 | 类型 | 用途 | 注意 |
 |------|------|------|------|
-| `tu` (tokenusage) | Rust CLI v1.5.2 | Codex/Anti token 读取 | 硬编码定价，不做对话去重 |
+| `tu` (tokenusage) | Rust CLI v1.5.2 | Codex/Claude/Anti 读取 | 需要额外验证和去重 |
 | `@ccusage/codex` | npm CLI | Codex 交叉验证 | LiteLLM 实时价，不做对话去重 |
+| `ccusage` | npm CLI | Claude Code 交叉验证 | 外部诊断，不作为强依赖 |
 | `state_5.sqlite` | Codex 本地 DB | 去重用 | `threads` 表有 title + tokens |
 
 ## 配置文件
@@ -99,5 +161,8 @@
 | `~/.config/anti-tracker/quota_price.json` | Anti 每 20% 档位价格 |
 | `~/.config/anti-tracker/current_model.json` | Anti 当前模型 |
 | `~/.config/anti-tracker/nettop_usage.jsonl` | Anti 网络流量日志 |
+| `~/.config/anti-tracker/quota_snapshots.jsonl` | Anti idle / adjusted cost 判断 |
 | `~/.codex/state_5.sqlite` | Codex session DB (去重) |
 | `~/.codex/sessions/` | Codex session JSONL (tu 数据源) |
+| `~/.claude/projects/` | Claude Code JSONL (本地 parser 数据源) |
+| `~/.config/claude/projects/` | Claude Code JSONL 兼容路径 |
